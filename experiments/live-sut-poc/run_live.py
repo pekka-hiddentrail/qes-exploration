@@ -19,14 +19,26 @@ from anthropic import Anthropic
 from dotenv import load_dotenv
 
 MODEL = "claude-sonnet-4-6"
-# The one calibrated pathological input (see sut.py) has a run of 25 repeated 'a's.
-# Backtracking blowup is exponential, so a proposed test with a longer repeated-char
-# run than this is untested and could hang the SUT for a very long time - refuse to
-# execute those for real rather than blindly sending them.
-MAX_SAFE_REPEAT_RUN = 25
 MAX_ATTEMPTS = 3
 SUT_URL = "http://localhost:8000/analyze"
-SLOW_THRESHOLD_MS = 500  # baseline calls top out ~110ms; a real regex blowup is multi-second
+SUT_DOCS_URL = "http://localhost:8000/docs"
+SUT_READY_TIMEOUT = 5.0
+
+# sut.py's regex (^(a+)+$) only backtracks catastrophically on runs of the letter 'a'
+# specifically - a long run of any OTHER character fails the match almost instantly
+# (no backtracking) and is completely safe. The calibrated pathological input has a
+# run of 25 'a's; a proposed test with a longer 'a'-run than this is untested and
+# could hang the SUT for a very long time, so it's refused rather than executed.
+DANGEROUS_CHAR = "a"
+MAX_SAFE_REPEAT_RUN = 25
+
+# A flat latency threshold can't tell "genuinely pathological" apart from "long but
+# ordinary input" (the SUT's normal cost model is linear in length). Instead, "slow"
+# means measured latency is SLOW_MULTIPLIER-x what the empirical baseline rate (from
+# the real, just-measured baseline calls) would predict for that input's length, with
+# SLOW_THRESHOLD_MS as a floor so short inputs aren't flagged on noise.
+SLOW_THRESHOLD_MS = 500
+SLOW_MULTIPLIER = 5
 
 BASELINE_TEXTS = [
     "Hello there, testing.",
@@ -135,6 +147,35 @@ Produce:
 Call submit_pattern_hypothesis with your answer."""
 
 
+def call_tool_with_retry(client, *, model, system, tools, tool_name, user_message, validate_fn, max_tokens):
+    """Shared call->validate->retry loop used by every tool-forced Claude call in this file."""
+    last_errors = ["no attempts made"]
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        message = client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            system=system,
+            tools=tools,
+            tool_choice={"type": "tool", "name": tool_name},
+            messages=[{"role": "user", "content": user_message}],
+        )
+
+        tool_use = next((block for block in message.content if block.type == "tool_use"), None)
+        if tool_use is None:
+            last_errors = [f"no tool_use block in response (stop_reason={message.stop_reason})"]
+            print(f"  attempt {attempt} produced no tool call: {last_errors} - retrying")
+            continue
+
+        errors = validate_fn(tool_use.input)
+        if not errors:
+            return tool_use.input
+
+        last_errors = errors
+        print(f"  attempt {attempt} produced malformed output: {errors} - retrying")
+
+    raise RuntimeError(f"Gave up after {MAX_ATTEMPTS} attempts, last errors: {last_errors}")
+
+
 def call_sut(client: httpx.Client, text: str) -> dict:
     start = time.perf_counter()
     response = client.post(SUT_URL, json={"text": text}, timeout=60.0)
@@ -161,6 +202,15 @@ def build_call_log(client: httpx.Client) -> list[dict]:
     return calls
 
 
+def baseline_rate_ms_per_char(calls: list[dict]) -> float:
+    """Empirical worst-case ms/char from the real baseline calls (excludes the pathological one)."""
+    rates = [
+        c["response"]["measured_latency_ms"] / max(len(c["request"]["body"]["text"]), 1)
+        for c in calls[: len(BASELINE_TEXTS)]
+    ]
+    return max(rates)
+
+
 def validate_pattern_hypothesis(data) -> list[str]:
     errors = []
     if not isinstance(data, dict):
@@ -185,8 +235,6 @@ def validate_pattern_hypothesis(data) -> list[str]:
 
     for test_key in ("confirm_test", "disconfirm_test"):
         test = data.get(test_key)
-        if test is None:
-            continue
         if not isinstance(test, dict):
             errors.append(f"'{test_key}' must be an object, got {type(test).__name__}")
             continue
@@ -208,40 +256,42 @@ def get_hypothesis(client: Anthropic, calls: list[dict]) -> dict:
         "scenario": "9 sequential calls to POST /analyze, a text-scoring endpoint. Same endpoint, same session, no other traffic in between.",
         "calls": calls,
     }
-    user_message = json.dumps(evidence, indent=2)
-
-    last_errors = []
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        message = client.messages.create(
-            model=MODEL,
-            max_tokens=1536,
-            system=SYSTEM_PROMPT,
-            tools=[PATTERN_TOOL],
-            tool_choice={"type": "tool", "name": "submit_pattern_hypothesis"},
-            messages=[{"role": "user", "content": user_message}],
-        )
-
-        tool_use = next(block for block in message.content if block.type == "tool_use")
-        errors = validate_pattern_hypothesis(tool_use.input)
-        if not errors:
-            return tool_use.input
-
-        last_errors = errors
-        print(f"  attempt {attempt} produced malformed output: {errors} - retrying")
-
-    raise RuntimeError(f"Gave up after {MAX_ATTEMPTS} attempts, last errors: {last_errors}")
+    return call_tool_with_retry(
+        client,
+        model=MODEL,
+        system=SYSTEM_PROMPT,
+        tools=[PATTERN_TOOL],
+        tool_name="submit_pattern_hypothesis",
+        user_message=json.dumps(evidence, indent=2),
+        validate_fn=validate_pattern_hypothesis,
+        max_tokens=1536,
+    )
 
 
-def longest_repeat_run(text: str) -> int:
-    return max((len(list(group)) for _, group in itertools.groupby(text)), default=0)
+def longest_run_of(text: str, char: str) -> int:
+    return max((len(list(group)) for key, group in itertools.groupby(text) if key == char), default=0)
 
 
-def execute_test(client: httpx.Client, test: dict) -> dict:
+assert longest_run_of(PATHOLOGICAL_TEXT, DANGEROUS_CHAR) <= MAX_SAFE_REPEAT_RUN, (
+    "PATHOLOGICAL_TEXT exceeds the safety ceiling that execute_test() enforces for "
+    "proposed tests, but build_call_log() sends it with no runtime guard - if this "
+    "constant is ever recalibrated longer, fix this assertion only after confirming "
+    "the new value's timing is still bounded (see sut.py)."
+)
+
+
+def classify_latency(measured_ms: float, text_length: int, baseline_rate: float) -> str:
+    expected_ms = baseline_rate * text_length
+    threshold = max(SLOW_THRESHOLD_MS, expected_ms * SLOW_MULTIPLIER)
+    return "slow" if measured_ms > threshold else "fast"
+
+
+def execute_test(client: httpx.Client, test: dict, baseline_rate: float) -> dict:
     text = test["text"]
-    run_length = longest_repeat_run(text)
+    run_length = longest_run_of(text, DANGEROUS_CHAR)
     if run_length > MAX_SAFE_REPEAT_RUN:
         print(
-            f"  refusing to execute: longest repeated-char run is {run_length}, "
+            f"  refusing to execute: longest run of '{DANGEROUS_CHAR}' is {run_length}, "
             f"exceeds safe ceiling of {MAX_SAFE_REPEAT_RUN}"
         )
         return {
@@ -250,7 +300,7 @@ def execute_test(client: httpx.Client, test: dict) -> dict:
             "predicted_latency_class": test["predicted_latency_class"],
             "skipped": True,
             "skip_reason": (
-                f"longest repeated-character run is {run_length} chars, exceeding the "
+                f"longest run of '{DANGEROUS_CHAR}' is {run_length} chars, exceeding the "
                 f"calibrated safe ceiling of {MAX_SAFE_REPEAT_RUN} - refused to avoid "
                 "hanging the SUT for an unknown, potentially very long time."
             ),
@@ -261,10 +311,10 @@ def execute_test(client: httpx.Client, test: dict) -> dict:
     # client pay a ~2s reconnection cost that has nothing to do with the SUT's own
     # latency - discovered when a disconfirm_test with no repeated characters at all
     # measured 2s despite the SUT reporting 38ms of actual work.
-    client.get("http://localhost:8000/docs", timeout=5.0)
+    client.get(SUT_DOCS_URL, timeout=SUT_READY_TIMEOUT)
 
     result = call_sut(client, text)
-    actual_latency_class = "slow" if result["measured_latency_ms"] > SLOW_THRESHOLD_MS else "fast"
+    actual_latency_class = classify_latency(result["measured_latency_ms"], len(text), baseline_rate)
     return {
         "sent_text": text,
         "predicted_outcome": test["predicted_outcome"],
@@ -345,28 +395,16 @@ def validate_skeptic_review(data) -> list[str]:
 
 def get_skeptic_review(client: Anthropic, claim: str, competing_explanation: str) -> dict:
     evidence = {"claim": claim, "competing_explanation": competing_explanation}
-    user_message = json.dumps(evidence, indent=2)
-
-    last_errors = []
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        message = client.messages.create(
-            model=MODEL,
-            max_tokens=1024,
-            system=SKEPTIC_SYSTEM_PROMPT,
-            tools=[SKEPTIC_TOOL],
-            tool_choice={"type": "tool", "name": "submit_skeptic_review"},
-            messages=[{"role": "user", "content": user_message}],
-        )
-
-        tool_use = next(block for block in message.content if block.type == "tool_use")
-        errors = validate_skeptic_review(tool_use.input)
-        if not errors:
-            return tool_use.input
-
-        last_errors = errors
-        print(f"  attempt {attempt} produced malformed output: {errors} - retrying")
-
-    raise RuntimeError(f"Gave up after {MAX_ATTEMPTS} attempts, last errors: {last_errors}")
+    return call_tool_with_retry(
+        client,
+        model=MODEL,
+        system=SKEPTIC_SYSTEM_PROMPT,
+        tools=[SKEPTIC_TOOL],
+        tool_name="submit_skeptic_review",
+        user_message=json.dumps(evidence, indent=2),
+        validate_fn=validate_skeptic_review,
+        max_tokens=1024,
+    )
 
 
 MAX_FOLLOWUP_ROUNDS = 2
@@ -408,7 +446,7 @@ disconfirm test. You'll now see what actually happened when those tests were run
 including cases where a test was refused rather than executed.
 
 IMPORTANT constraint: this SUT will refuse to execute any test whose text contains a run of the
-same character longer than {MAX_SAFE_REPEAT_RUN} characters, to avoid hanging indefinitely on an
+letter 'a' longer than {MAX_SAFE_REPEAT_RUN} characters, to avoid hanging indefinitely on an
 untested, exponentially-slower input. Design any new test within that constraint - a test that
 gets refused again tells you nothing new.
 
@@ -459,28 +497,16 @@ def get_followup(client: Anthropic, hypothesis: dict, history: list[dict]) -> di
         "competing_explanation": hypothesis["competing_explanation"],
         "rounds_so_far": history,
     }
-    user_message = json.dumps(evidence, indent=2)
-
-    last_errors = []
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        message = client.messages.create(
-            model=MODEL,
-            max_tokens=1024,
-            system=FOLLOWUP_SYSTEM_PROMPT,
-            tools=[FOLLOWUP_TOOL],
-            tool_choice={"type": "tool", "name": "submit_followup"},
-            messages=[{"role": "user", "content": user_message}],
-        )
-
-        tool_use = next(block for block in message.content if block.type == "tool_use")
-        errors = validate_followup(tool_use.input)
-        if not errors:
-            return tool_use.input
-
-        last_errors = errors
-        print(f"  attempt {attempt} produced malformed output: {errors} - retrying")
-
-    raise RuntimeError(f"Gave up after {MAX_ATTEMPTS} attempts, last errors: {last_errors}")
+    return call_tool_with_retry(
+        client,
+        model=MODEL,
+        system=FOLLOWUP_SYSTEM_PROMPT,
+        tools=[FOLLOWUP_TOOL],
+        tool_name="submit_followup",
+        user_message=json.dumps(evidence, indent=2),
+        validate_fn=validate_followup,
+        max_tokens=1024,
+    )
 
 
 def main():
@@ -490,70 +516,84 @@ def main():
         raise SystemExit("Set ANTHROPIC_API_KEY in .env (see .env.example)")
 
     anthropic_client = Anthropic(api_key=api_key)
+    base_dir = Path(__file__).parent
+    out_dir = base_dir / "results"
+
+    def write_output(output: dict) -> None:
+        out_dir.mkdir(exist_ok=True)
+        out_path = out_dir / "output.json"
+        out_path.write_text(json.dumps(output, indent=2))
+        print(f"\nWrote result to {out_path}")
 
     with httpx.Client() as http_client:
         try:
-            http_client.get("http://localhost:8000/docs", timeout=2.0)
-        except httpx.ConnectError:
+            http_client.get(SUT_DOCS_URL, timeout=SUT_READY_TIMEOUT)
+        except httpx.TransportError:
             raise SystemExit("sut.py isn't running. Start it first: uvicorn sut:app --port 8000")
 
         print("Building call log from live SUT...")
         calls = build_call_log(http_client)
+        rate = baseline_rate_ms_per_char(calls)
 
-        print("Asking Claude for a hypothesis...")
-        hypothesis = get_hypothesis(anthropic_client, calls)
+        output = {"calls": calls}
+        try:
+            print("Asking Claude for a hypothesis...")
+            hypothesis = get_hypothesis(anthropic_client, calls)
+            output["hypothesis"] = hypothesis
 
-        print("Asking Skeptic for a cold review (claim + competing_explanation only)...")
-        skeptic_review = get_skeptic_review(anthropic_client, hypothesis["claim"], hypothesis["competing_explanation"])
-        print(f"  skeptic verdict: {skeptic_review['skeptic_verdict']}, competing_explanation assessed as: {skeptic_review['competing_explanation_assessment']}")
+            print("Asking Skeptic for a cold review (claim + competing_explanation only)...")
+            skeptic_review = get_skeptic_review(anthropic_client, hypothesis["claim"], hypothesis["competing_explanation"])
+            output["skeptic_review"] = skeptic_review
+            print(f"  skeptic verdict: {skeptic_review['skeptic_verdict']}, competing_explanation assessed as: {skeptic_review['competing_explanation_assessment']}")
 
-        print("Executing confirm_test against the live SUT...")
-        confirm_result = execute_test(http_client, hypothesis["confirm_test"])
+            print("Executing confirm_test against the live SUT...")
+            confirm_result = execute_test(http_client, hypothesis["confirm_test"], rate)
+            output["confirm_result"] = confirm_result
 
-        print("Executing disconfirm_test against the live SUT...")
-        disconfirm_result = execute_test(http_client, hypothesis["disconfirm_test"])
+            print("Executing disconfirm_test against the live SUT...")
+            disconfirm_result = execute_test(http_client, hypothesis["disconfirm_test"], rate)
+            output["disconfirm_result"] = disconfirm_result
 
-        history = [
-            {"round": "confirm_test", **confirm_result},
-            {"round": "disconfirm_test", **disconfirm_result},
-        ]
-        followup_rounds = []
-        for round_num in range(1, MAX_FOLLOWUP_ROUNDS + 1):
-            print(f"Asking Claude for a verdict + follow-up (round {round_num})...")
-            followup = get_followup(anthropic_client, hypothesis, history)
-            print(f"  verdict: {followup['verdict']} - continue: {followup['continue_investigation']}")
+            history = [
+                {"round": "confirm_test", **confirm_result},
+                {"round": "disconfirm_test", **disconfirm_result},
+            ]
+            followup_rounds = []
+            stopped_reason = "round_cap_reached"
+            for round_num in range(1, MAX_FOLLOWUP_ROUNDS + 1):
+                print(f"Asking Claude for a verdict + follow-up (round {round_num})...")
+                followup = get_followup(anthropic_client, hypothesis, history)
+                print(f"  verdict: {followup['verdict']} - continue: {followup['continue_investigation']}")
 
-            round_entry = {
-                "verdict": followup["verdict"],
-                "reasoning": followup["reasoning"],
-                "continue_investigation": followup["continue_investigation"],
-            }
-            if not followup["continue_investigation"]:
+                round_entry = {
+                    "verdict": followup["verdict"],
+                    "reasoning": followup["reasoning"],
+                    "continue_investigation": followup["continue_investigation"],
+                }
+                if not followup["continue_investigation"]:
+                    followup_rounds.append(round_entry)
+                    stopped_reason = "satisfied"
+                    break
+
+                print(f"  executing follow-up test (round {round_num})...")
+                test_result = execute_test(http_client, followup["next_test"], rate)
+                round_entry["test_result"] = test_result
                 followup_rounds.append(round_entry)
-                break
+                history.append({"round": f"followup_{round_num}", **test_result})
 
-            print(f"  executing follow-up test (round {round_num})...")
-            test_result = execute_test(http_client, followup["next_test"])
-            round_entry["test_result"] = test_result
-            followup_rounds.append(round_entry)
-            history.append({"round": f"followup_{round_num}", **test_result})
+            output["followup_rounds"] = followup_rounds
+            # "round_cap_reached" here means the last executed follow-up test (if any)
+            # in followup_rounds never got a verdict rendered on it - the loop ran out
+            # of rounds while the model still wanted to continue investigating.
+            output["followup_stopped_reason"] = stopped_reason
 
-    output = {
-        "calls": calls,
-        "hypothesis": hypothesis,
-        "skeptic_review": skeptic_review,
-        "confirm_result": confirm_result,
-        "disconfirm_result": disconfirm_result,
-        "followup_rounds": followup_rounds,
-    }
+        except RuntimeError as e:
+            print(f"Stopped early: {e}")
+            output["error"] = str(e)
 
-    base_dir = Path(__file__).parent
-    out_dir = base_dir / "results"
-    out_dir.mkdir(exist_ok=True)
-    out_path = out_dir / "output.json"
-    out_path.write_text(json.dumps(output, indent=2))
-    print(f"\nWrote result to {out_path}")
-    print("Now score it by hand against rubric.md.")
+    write_output(output)
+    if "error" not in output:
+        print("Now score it by hand against rubric.md.")
 
 
 if __name__ == "__main__":
