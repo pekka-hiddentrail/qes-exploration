@@ -1,0 +1,141 @@
+{
+  "scenario": "9 sequential calls to POST /analyze, a text-scoring endpoint. Same endpoint, same session, no other traffic in between.",
+  "calls": [
+    {
+      "index": 1,
+      "request": {
+        "method": "POST",
+        "path": "/analyze",
+        "body": {
+          "text": "Hello there, testing."
+        }
+      },
+      "response": {
+        "status": 200,
+        "char_count": 21,
+        "latency_ms": 38
+      }
+    },
+    {
+      "index": 2,
+      "request": {
+        "method": "POST",
+        "path": "/analyze",
+        "body": {
+          "text": "A short one."
+        }
+      },
+      "response": {
+        "status": 200,
+        "char_count": 12,
+        "latency_ms": 24
+      }
+    },
+    {
+      "index": 3,
+      "request": {
+        "method": "POST",
+        "path": "/analyze",
+        "body": {
+          "text": "This is a moderately long input string for testing."
+        }
+      },
+      "response": {
+        "status": 200,
+        "char_count": 51,
+        "latency_ms": 71
+      }
+    },
+    {
+      "index": 4,
+      "request": {
+        "method": "POST",
+        "path": "/analyze",
+        "body": {
+          "text": "Short again."
+        }
+      },
+      "response": {
+        "status": 200,
+        "char_count": 12,
+        "latency_ms": 22
+      }
+    },
+    {
+      "index": 5,
+      "request": {
+        "method": "POST",
+        "path": "/analyze",
+        "body": {
+          "text": "Here is a somewhat longer message than before, used to check timing."
+        }
+      },
+      "response": {
+        "status": 200,
+        "char_count": 68,
+        "latency_ms": 88
+      }
+    },
+    {
+      "index": 6,
+      "request": {
+        "method": "POST",
+        "path": "/analyze",
+        "body": {
+          "text": "Tiny."
+        }
+      },
+      "response": {
+        "status": 200,
+        "char_count": 5,
+        "latency_ms": 14
+      }
+    },
+    {
+      "index": 7,
+      "request": {
+        "method": "POST",
+        "path": "/analyze",
+        "body": {
+          "text": "This one is quite a bit longer than most of the previous test messages we've sent so far."
+        }
+      },
+      "response": {
+        "status": 200,
+        "char_count": 89,
+        "latency_ms": 108
+      }
+    },
+    {
+      "index": 8,
+      "request": {
+        "method": "POST",
+        "path": "/analyze",
+        "body": {
+          "text": "Medium length input for the ninth or so call in this sequence."
+        }
+      },
+      "response": {
+        "status": 200,
+        "char_count": 62,
+        "latency_ms": 79
+      }
+    },
+    {
+      "index": 9,
+      "request": {
+        "method": "POST",
+        "path": "/analyze",
+        "body": {
+          "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab!"
+        }
+      },
+      "response": {
+        "status": 200,
+        "char_count": 64,
+        "latency_ms": 6400
+      }
+    }
+  ],
+  "ground_truth": "Calls 1-8 show latency scaling roughly linearly with input length because the endpoint tokenizes and scores every character - a real but boring, expected cost model, not a bug. Call 9's text is unremarkable in length (64 chars, similar to call 8's 62) but contains a long run of a repeated character followed by a non-matching character, which triggers catastrophic backtracking in a regex used by an input-sanitization step (checking for banned repeated-character patterns). The latency spike is caused by that regex, is independent of text length, and is unrelated to the normal per-character cost model that explains calls 1-8."
+}

@@ -1,0 +1,103 @@
+[
+  {
+    "id": "case-01-cancel-status-mismatch",
+    "category": "self-consistency",
+    "request": {
+      "method": "POST",
+      "path": "/orders/482910/cancel",
+      "body": {}
+    },
+    "response": {
+      "status": 200,
+      "body": { "order_id": 482910, "status": "confirmed", "cancelled_at": null }
+    },
+    "context": null,
+    "expected": "Per the API docs, a successful cancel request returns the order with status:'cancelled' and a non-null cancelled_at timestamp.",
+    "observed": "The request returned 200 (success), but the response body still shows status:'confirmed' and cancelled_at:null.",
+    "ground_truth": "Cancellation is processed asynchronously via a queue; the response is built from a read of the order taken before the write completes, so 200 is returned before the state actually changes. Polling GET /orders/482910 a few seconds later shows status:'cancelled'. It is an eventual-consistency lag, not a failed cancellation."
+  },
+  {
+    "id": "case-02-promo-discount-inconsistency",
+    "category": "statistical-trend",
+    "request": {
+      "method": "POST",
+      "path": "/cart/checkout",
+      "body": { "promo_code": "SAVE10" }
+    },
+    "response": {
+      "status": 200,
+      "body": { "discount_applied": 0.15, "total": 84.99, "promo_rule_id": "rule_1290" }
+    },
+    "context": [
+      {
+        "note": "Same cart contents and same promo code, submitted 3 minutes earlier by the same session.",
+        "response": { "status": 200, "body": { "discount_applied": 0.10, "total": 89.99, "promo_rule_id": "rule_889" } }
+      }
+    ],
+    "expected": "Promo code SAVE10 is documented as a fixed 10% discount; repeated use in the same session should apply identically.",
+    "observed": "This call applied 15% instead of 10% for the identical cart and code, and the response references a different promo_rule_id than the earlier call.",
+    "ground_truth": "A flash-sale campaign temporarily overrode SAVE10 to 15% for a 20-minute rollout window under a new rule id, then rolled back. It is a config overlap between two active campaigns, not a race condition or double-application bug."
+  },
+  {
+    "id": "case-03-soft-delete-not-applied",
+    "category": "self-consistency",
+    "request": {
+      "method": "DELETE",
+      "path": "/users/58213",
+      "body": {}
+    },
+    "response": {
+      "status": 204,
+      "body": null
+    },
+    "context": [
+      {
+        "note": "Immediately following GET on the same resource.",
+        "request": { "method": "GET", "path": "/users/58213" },
+        "response": { "status": 200, "body": { "id": 58213, "email": "j.doe@example.com", "active": true, "deletion_status": "pending_batch" } }
+      }
+    ],
+    "expected": "Per spec, DELETE removes the user immediately; a subsequent GET on that id should return 404.",
+    "observed": "GET after DELETE returns 200 with the full user record, active:true, and an undocumented deletion_status:'pending_batch' field.",
+    "ground_truth": "DELETE only flags the record for a nightly batch job to hard-delete; synchronous deletion was never implemented, contradicting the documented immediate-delete contract. It is a spec/implementation mismatch, not a failed or silently-erroring DELETE."
+  },
+  {
+    "id": "case-04-200-on-validation-error",
+    "category": "spec-conformance",
+    "request": {
+      "method": "POST",
+      "path": "/signup",
+      "body": { "email": "not-an-email", "password": "x" }
+    },
+    "response": {
+      "status": 200,
+      "body": { "success": false, "error": "invalid email format" }
+    },
+    "context": null,
+    "expected": "Per the OpenAPI spec, invalid input returns 400 Bad Request with an error body.",
+    "observed": "The server returned HTTP 200 with success:false in the body instead of a 4xx status code.",
+    "ground_truth": "The signup endpoint was migrated to a new framework six months ago that defaults to 200 for any handled (non-exception) response; the error-status contract was never re-implemented. This affects all validation failures on this route (e.g. missing password would also return 200), not just malformed email specifically."
+  },
+  {
+    "id": "case-05-search-latency-spike",
+    "category": "statistical-trend",
+    "request": {
+      "method": "GET",
+      "path": "/search?q=laptop"
+    },
+    "response": {
+      "status": 200,
+      "latency_ms": 4200,
+      "body": { "result_count": 20 }
+    },
+    "context": [
+      {
+        "note": "Latency in ms for the prior 10 calls to /search from this session, in order.",
+        "latencies_ms": [62, 58, 71, 65, 60, 590, 55, 63, 59, 68]
+      }
+    ],
+    "expected": "Search has historically responded in 50-80ms for this session's baseline.",
+    "observed": "This call took 4200ms (~60x baseline). A smaller spike (590ms) occurred a few calls earlier for a different, less common query term.",
+    "ground_truth": "The search index cache is small and LRU-evicting; queries for uncommon terms fall through to an uncached, slow path. It correlates with query-term rarity, not request volume or general backend load. Repeating the identical query immediately afterward returns in ~60ms because the term is now cached."
+  }
+]
