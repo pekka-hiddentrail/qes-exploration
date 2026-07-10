@@ -11,6 +11,7 @@ predicted_latency_class.
 import itertools
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -54,6 +55,57 @@ BASELINE_TEXTS = [
 # Calibrated empirically (see sut.py docstring): 25 'a's + '!' takes ~3.6s on this
 # machine via catastrophic regex backtracking, despite unremarkable length (26 chars).
 PATHOLOGICAL_TEXT = "a" * 25 + "!"
+
+# Matches a run of 3+ identical characters, optionally followed by one different
+# character (the pathological pattern's structure: a repeated run + a terminator
+# that breaks it). \1{2,} requires 2+ repeats of the already-captured first
+# character, so the whole run is 3+ chars total.
+_REPEAT_RUN_PATTERN = re.compile(r"(.)\1{2,}(.)?")
+
+
+def redact_pathological_content(text: str) -> str:
+    """Replace literal repeated-character runs with a structural placeholder (length
+    only, no character identity) before handing text to any LLM call other than the
+    one that actually has to compose real, executable request bodies. This is a
+    deliberate blind spot: "aaaa...a!" is a famous textbook ReDoS trigger, and a model
+    that sees it verbatim might be recognizing a shape from training data rather than
+    inferring cause from the timing signal alone. Keeping the length visible while
+    hiding which character was used still lets genuine structural reasoning happen.
+    """
+    if not isinstance(text, str):
+        return text
+
+    def replace_run(match):
+        full = match.group(0)
+        terminator = match.group(2)
+        run_len = len(full) - (1 if terminator else 0)
+        if terminator:
+            return f"[a run of {run_len} repeated identical characters, followed by one different character]"
+        return f"[a run of {run_len} repeated identical characters]"
+
+    return _REPEAT_RUN_PATTERN.sub(replace_run, text)
+
+
+def redact_calls_for_model(calls: list[dict]) -> list[dict]:
+    """Deep-copy calls with request text redacted - never mutates the original list,
+    which is still written to results/output.json with full fidelity for humans."""
+    redacted = json.loads(json.dumps(calls))
+    for call in redacted:
+        call["request"]["body"]["text"] = redact_pathological_content(call["request"]["body"]["text"])
+    return redacted
+
+
+def redact_history_for_model(history: list[dict]) -> list[dict]:
+    """Same idea as redact_calls_for_model, for the round-by-round history shown to
+    get_followup: redact the literal executed text and any free-text fields that
+    might quote it, without touching the original (kept intact for output.json)."""
+    redacted = json.loads(json.dumps(history))
+    for entry in redacted:
+        for key in ("sent_text", "predicted_outcome", "skip_reason"):
+            if key in entry:
+                entry[key] = redact_pathological_content(entry[key])
+    return redacted
+
 
 PATTERN_TOOL = {
     "name": "submit_pattern_hypothesis",
@@ -254,7 +306,7 @@ def validate_pattern_hypothesis(data) -> list[str]:
 def get_hypothesis(client: Anthropic, calls: list[dict]) -> dict:
     evidence = {
         "scenario": "9 sequential calls to POST /analyze, a text-scoring endpoint. Same endpoint, same session, no other traffic in between.",
-        "calls": calls,
+        "calls": redact_calls_for_model(calls),
     }
     return call_tool_with_retry(
         client,
@@ -264,7 +316,7 @@ def get_hypothesis(client: Anthropic, calls: list[dict]) -> dict:
         tool_name="submit_pattern_hypothesis",
         user_message=json.dumps(evidence, indent=2),
         validate_fn=validate_pattern_hypothesis,
-        max_tokens=1536,
+        max_tokens=2048,
     )
 
 
@@ -349,12 +401,19 @@ SKEPTIC_TOOL = {
                 "type": "string",
                 "description": "Your OWN best alternative explanation, formed independently - not just restating the given competing explanation.",
             },
+            "disproof_strategies": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "At least 2 concrete, distinct ways one could test to show this claim is WRONG - genuine falsification angles (e.g. a specific comparison or probe that would surprise you if the claim held), not just restated doubts from your reasoning.",
+                "minItems": 2,
+            },
             "reasoning": {"type": "string"},
         },
         "required": [
             "skeptic_verdict",
             "competing_explanation_assessment",
             "skeptic_alternative",
+            "disproof_strategies",
             "reasoning",
         ],
     },
@@ -372,6 +431,11 @@ alternative. Assess whether the given competing explanation is a genuine rival e
 strawman that doesn't seriously threaten the claim. Give your honest verdict on whether the claim
 holds up to scrutiny on its own terms, absent any evidence either way.
 
+Also propose at least 2 concrete, distinct ways someone could actually test to prove this claim
+WRONG - real falsification strategies (e.g. a specific comparison, a specific probe, a specific
+boundary to check), not a restatement of your doubts. Think about what a genuinely surprising
+result would look like if the claim were false, not just what would make you personally uneasy.
+
 Call submit_skeptic_review with your answer."""
 
 
@@ -380,7 +444,7 @@ def validate_skeptic_review(data) -> list[str]:
     if not isinstance(data, dict):
         return [f"expected an object, got {type(data).__name__}"]
 
-    for key in ("skeptic_verdict", "competing_explanation_assessment", "skeptic_alternative", "reasoning"):
+    for key in ("skeptic_verdict", "competing_explanation_assessment", "skeptic_alternative", "disproof_strategies", "reasoning"):
         if key not in data:
             errors.append(f"missing required field '{key}'")
 
@@ -390,11 +454,18 @@ def validate_skeptic_review(data) -> list[str]:
     if data.get("competing_explanation_assessment") not in ("genuine", "strawman"):
         errors.append("'competing_explanation_assessment' must be 'genuine' or 'strawman'")
 
+    strategies = data.get("disproof_strategies")
+    if not isinstance(strategies, list) or len(strategies) < 2 or not all(isinstance(s, str) for s in strategies):
+        errors.append("'disproof_strategies' must be a list of at least 2 strings")
+
     return errors
 
 
 def get_skeptic_review(client: Anthropic, claim: str, competing_explanation: str) -> dict:
-    evidence = {"claim": claim, "competing_explanation": competing_explanation}
+    evidence = {
+        "claim": redact_pathological_content(claim),
+        "competing_explanation": redact_pathological_content(competing_explanation),
+    }
     return call_tool_with_retry(
         client,
         model=MODEL,
@@ -403,7 +474,7 @@ def get_skeptic_review(client: Anthropic, claim: str, competing_explanation: str
         tool_name="submit_skeptic_review",
         user_message=json.dumps(evidence, indent=2),
         validate_fn=validate_skeptic_review,
-        max_tokens=1024,
+        max_tokens=1536,
     )
 
 
@@ -445,10 +516,10 @@ You already formed a hypothesis and a competing explanation, and proposed a conf
 disconfirm test. You'll now see what actually happened when those tests were run for real -
 including cases where a test was refused rather than executed.
 
-IMPORTANT constraint: this SUT will refuse to execute any test whose text contains a run of the
-letter 'a' longer than {MAX_SAFE_REPEAT_RUN} characters, to avoid hanging indefinitely on an
-untested, exponentially-slower input. Design any new test within that constraint - a test that
-gets refused again tells you nothing new.
+IMPORTANT constraint: this SUT will refuse to execute any test whose text contains a run of one
+repeated character longer than {MAX_SAFE_REPEAT_RUN} characters, regardless of which character, to
+avoid hanging indefinitely on an untested, exponentially-slower input. Design any new test within
+that constraint - a test that gets refused again tells you nothing new.
 
 Decide:
 1. Is the hypothesis corroborated (survived a real disconfirmation attempt), refuted (contradicted
@@ -493,9 +564,9 @@ def validate_followup(data) -> list[str]:
 
 def get_followup(client: Anthropic, hypothesis: dict, history: list[dict]) -> dict:
     evidence = {
-        "claim": hypothesis["claim"],
-        "competing_explanation": hypothesis["competing_explanation"],
-        "rounds_so_far": history,
+        "claim": redact_pathological_content(hypothesis["claim"]),
+        "competing_explanation": redact_pathological_content(hypothesis["competing_explanation"]),
+        "rounds_so_far": redact_history_for_model(history),
     }
     return call_tool_with_retry(
         client,
@@ -505,7 +576,7 @@ def get_followup(client: Anthropic, hypothesis: dict, history: list[dict]) -> di
         tool_name="submit_followup",
         user_message=json.dumps(evidence, indent=2),
         validate_fn=validate_followup,
-        max_tokens=1024,
+        max_tokens=1536,
     )
 
 
