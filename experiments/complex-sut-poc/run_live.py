@@ -11,14 +11,15 @@ plus exactly one real "happy day" call - then has to design and execute its own
 tests from there, including discovering on its own whether concurrency is worth
 testing at all.
 
-Casting is broken into small checkpoints exactly as in live-sut-poc: if a
-checkpoint's rounds find nothing anomalous, the Driver characterizes behavior so
-far and a cold Skeptic critiques it before the next checkpoint proceeds. The
-moment any test's burst shows more accepted requests than the disclosed rate
-limit allows, casting stops and hands off to formal hypothesis formation, a
-separate Skeptic review, confirm/disconfirm execution, a bounded follow-up loop,
-and a bug report - all unchanged in spirit from live-sut-poc, adapted to this
-SUT's request/response shape.
+Unlike live-sut-poc, there is no hard split between "blind discovery" and a
+separate "investigation" pipeline once something is found. Every checkpoint does
+the same thing: propose and execute a real batch of tests, then form a hypothesis
+about the system's behavior AND any anomalies noticed (zero, one, or several) -
+which a cold Skeptic reviews. A "weak" verdict sends the Driver into another
+checkpoint, informed by the critique, to gather more real evidence; "strong_enough"
+ends the loop. Whether an anomaly is currently believed to exist doesn't change the
+mechanism - the Skeptic's verdict is what decides whether to keep going, uniformly.
+If the final hypothesis claims any anomalies, a bug report is written for each.
 """
 
 import itertools
@@ -51,21 +52,14 @@ SUT_READY_TIMEOUT = 5.0
 # resource usage and keep test results a manageable size.
 MAX_REQUEST_COUNT = 20
 
-ROUNDS_PER_CHECKPOINT = 2
-MAX_CHECKPOINTS = 2
-MAX_FOLLOWUP_ROUNDS = 2
+# Total checkpoints in the whole loop before concluding regardless of Skeptic's
+# verdict - covers both "still exploring blind" and "still being challenged on an
+# anomaly claim," since those are the same mechanism now, not two different phases
+# with separate budgets.
+MAX_CHECKPOINTS = 4
 
-# Total hypothesis attempts (initial + revisions) before proceeding to
-# confirm/disconfirm regardless of Skeptic's verdict. Without this cap, a
-# "weak" verdict on the initial claim only ever fed into the *optional*
-# follow-up loop, after confirm/disconfirm tests chosen before Skeptic saw
-# anything had already spent the test budget - Skeptic's verdict had no actual
-# power to stop a shaky claim from being tested as-is. Now a "weak" verdict
-# sends the Driver back to revise before any real test budget is spent.
-MAX_HYPOTHESIS_ATTEMPTS = 2
-
-# The very first round is the only genuinely "know nothing" moment - nothing has
-# been tested or ruled out yet, so it's the right place to spend extra breadth.
+# The very first checkpoint is the only genuinely "know nothing" moment - nothing
+# has been tested or ruled out yet, so it's the right place to spend extra breadth.
 FIRST_ROUND_TEST_BUDGET = 10
 DEFAULT_TEST_BUDGET = 6
 
@@ -301,7 +295,8 @@ CASTING_TOOL = {
 
 def casting_system_prompt(test_budget: int, is_first_round: bool) -> str:
     if is_first_round:
-        context_instruction = """Before proposing anything, think about context: what can you reasonably assume
+        context_instruction = """Nothing is currently flagged as anomalous, and you do not know whether any
+bug exists at all. Before proposing anything, think about context: what can you reasonably assume
 about this kind of system (a rate-limited submission API) given its apparent purpose, and what bug
 classes are commonly seen in this category of implementation (e.g. off-by-one window boundaries,
 race conditions/TOCTOU bugs in shared counters, quota not resetting correctly, inconsistent handling
@@ -309,16 +304,18 @@ of unusual client_id values, input validation gaps)? Use that to inform your hyp
 substitute for testing, but as a reason to prioritize some categories over others when you're
 starting from nothing. State this reasoning explicitly."""
     else:
-        context_instruction = """You now have real test results, not just assumptions about this kind of system.
-Before proposing anything, briefly state what you've actually learned so far (not what's typical for
-this category in general, but what THIS system has actually shown) and how that's changing your
-approach this round - narrowing toward what looks promising, or ruling out categories that turned
-out unremarkable."""
+        context_instruction = """You now have real test results, and prior_checkpoint_feedback holds the
+previous checkpoint's hypothesis plus Skeptic's cold critique of it. If that hypothesis claimed any
+anomalies that Skeptic found weak, prioritize tests that could confirm OR refute those SPECIFIC
+claims - operationalize Skeptic's anomaly_critique and gaps into literal tests, not just unrelated
+new exploration. If Skeptic flagged the absence of any anomaly claim as premature given what's been
+tested, prioritize whatever category it pointed at. Briefly state what you've actually learned so
+far (not what's typical for this category in general, but what THIS system has actually shown) and
+how that's changing your approach this round."""
 
     return f"""You are testing a live API endpoint (POST /submit, a rate-limited submission
 service) to look for bugs or unexpected behavior. You've been shown the API's schema
-documentation and one real "happy day" call. Nothing is currently flagged as anomalous, and
-you do not know whether any bug exists at all.
+documentation and one real "happy day" call.
 
 {context_instruction}
 
@@ -352,17 +349,10 @@ try a substantially reduced request_count in this round before moving on to a di
 If you believe you've explored reasonably and have no more good ideas worth proposing, set
 give_up to true rather than proposing something arbitrary just to have something to submit.
 
-If "prior_checkpoint_feedback" is present in the evidence, it's an independent cold critique of
-a behavior characterization from your last checkpoint - including gaps and untested areas it
-flagged. Use it to inform what you prioritize this round, though you still decide what to
-actually test, not the critique itself.
-
 Prioritize breadth over depth. Before proposing a test, check tests_tried_in_earlier_rounds: if
 the same underlying question has already been asked multiple times with consistent results,
 treat it as settled - don't ask a third or fourth variant of it unless something specific
-suggests the picture has actually changed. When prior_checkpoint_feedback names gaps,
-prioritize genuinely new categories over refining a theory that already has consistent
-supporting evidence.
+suggests the picture has actually changed.
 
 Call submit_casting_round with your answer."""
 
@@ -445,15 +435,26 @@ def get_casting_round(
     )
 
 
-BEHAVIOR_HYPOTHESIS_TOOL = {
-    "name": "submit_behavior_hypothesis",
-    "description": "Characterize what you've learned about this system's behavior so far - not a bug claim, a general characterization.",
+HYPOTHESIS_TOOL = {
+    "name": "submit_checkpoint_hypothesis",
+    "description": "Characterize the system's behavior based on real test results so far, including any anomalies (possible bugs) noticed.",
     "input_schema": {
         "type": "object",
         "properties": {
             "observed_behavior": {
                 "type": "string",
-                "description": "General characterization: confirmed patterns, categories tested and found normal, how the rate limit behaves under the conditions you've tried.",
+                "description": "General characterization: confirmed patterns, categories tested and found normal.",
+            },
+            "anomalies": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Zero or more possible bugs noticed. Each entry should be a specific, falsifiable claim "
+                    "in its own words - which test number(s) revealed it, what you believe the mechanism is, "
+                    "how severe it would be if true, and a genuine competing explanation for the same "
+                    "observation (not a strawman you'd easily dismiss). Leave empty if nothing anomalous has "
+                    "been found yet - don't force a claim that isn't there."
+                ),
             },
             "untested_areas": {
                 "type": "array",
@@ -462,156 +463,169 @@ BEHAVIOR_HYPOTHESIS_TOOL = {
                 "minItems": 1,
             },
         },
-        "required": ["observed_behavior", "untested_areas"],
+        "required": ["observed_behavior", "anomalies", "untested_areas"],
     },
 }
 
-BEHAVIOR_HYPOTHESIS_SYSTEM_PROMPT = """You are characterizing a system's behavior so far, based on
-real test results from this session. You have NOT found anything anomalous yet - this is not a bug
-claim, it's an honest summary of what you've learned and what remains untested.
+HYPOTHESIS_SYSTEM_PROMPT = """You are characterizing this system's behavior based on real test results
+from this session so far. Describe the general behavior pattern, and list any anomalies (possible
+bugs) you've noticed - each as a specific, falsifiable claim referencing the test number(s) that
+revealed it, your best guess at the mechanism, its severity if true, and a genuine rival explanation
+for the same observation (not a strawman). If nothing anomalous has turned up yet, leave anomalies
+empty rather than forcing a claim that isn't there. List what's still untested.
 
-Call submit_behavior_hypothesis with your answer."""
+Call submit_checkpoint_hypothesis with your answer."""
 
 
-def validate_behavior_hypothesis(data) -> list[str]:
+def validate_hypothesis_response(data) -> list[str]:
     errors = []
     if not isinstance(data, dict):
         return [f"expected an object, got {type(data).__name__}"]
-    for key in ("observed_behavior", "untested_areas"):
+    for key in ("observed_behavior", "anomalies", "untested_areas"):
         if key not in data:
             errors.append(f"missing required field '{key}'")
+    anomalies = data.get("anomalies")
+    if not isinstance(anomalies, list) or not all(isinstance(a, str) for a in anomalies):
+        errors.append("'anomalies' must be a list of strings (may be empty)")
     areas = data.get("untested_areas")
     if not isinstance(areas, list) or not areas or not all(isinstance(a, str) for a in areas):
         errors.append("'untested_areas' must be a non-empty list of strings")
     return errors
 
 
-def get_behavior_hypothesis(client: Anthropic, happy_day_example: dict, casting_log: list[dict]) -> dict:
+def get_checkpoint_hypothesis(client: Anthropic, happy_day_example: dict, casting_log: list[dict]) -> dict:
     evidence = {
         "api_schema": API_SCHEMA_DOC,
         "happy_day_example": happy_day_example,
-        "tests_executed_this_session": redact_history_for_model(casting_log),
+        "all_tests_this_session": redact_history_for_model(casting_log),
     }
     return call_tool_with_retry(
         client,
         model=MODEL,
-        system=BEHAVIOR_HYPOTHESIS_SYSTEM_PROMPT,
-        tools=[BEHAVIOR_HYPOTHESIS_TOOL],
-        tool_name="submit_behavior_hypothesis",
+        system=HYPOTHESIS_SYSTEM_PROMPT,
+        tools=[HYPOTHESIS_TOOL],
+        tool_name="submit_checkpoint_hypothesis",
         user_message=json.dumps(evidence, indent=2),
-        validate_fn=validate_behavior_hypothesis,
-        max_tokens=1536,
+        validate_fn=validate_hypothesis_response,
+        max_tokens=2048,
     )
 
 
-BEHAVIOR_SKEPTIC_TOOL = {
-    "name": "submit_behavior_skeptic_review",
-    "description": "Cold-review a behavior characterization - you have NOT seen the underlying test data. Poke holes in it; don't rubber-stamp it.",
+SKEPTIC_TOOL = {
+    "name": "submit_skeptic_review",
+    "description": "Cold-review a checkpoint hypothesis - you have NOT seen the underlying test data. Poke holes in it; don't rubber-stamp it.",
     "input_schema": {
         "type": "object",
         "properties": {
-            "assessment": {
+            "verdict": {
                 "type": "string",
-                "enum": ["well_supported", "premature"],
-                "description": "Is this characterization adequately supported by what it claims to have tested, or overconfident given known gaps?",
+                "enum": ["weak", "strong_enough"],
+                "description": "'weak' if the hypothesis (its behavior characterization and/or any anomaly claims) is not adequately supported yet. 'strong_enough' only if you genuinely have no material objection left.",
             },
             "gaps": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "At least 2 concrete gaps, untested areas, or weak assumptions in this characterization - things that, if tested, might change the picture.",
+                "description": "At least 2 concrete gaps, untested areas, or weak assumptions - things that, if tested, might change the picture.",
                 "minItems": 2,
+            },
+            "anomaly_critique": {
+                "type": "string",
+                "description": (
+                    "If any anomalies were claimed: your independent alternative explanation for the same "
+                    "observation(s), and whether each claim's own competing explanation was genuine or a "
+                    "strawman, plus concrete ways to distinguish rival explanations from the claim. If no "
+                    "anomalies were claimed, briefly say whether that absence itself seems premature given "
+                    "what's been tested."
+                ),
             },
             "reasoning": {"type": "string"},
         },
-        "required": ["assessment", "gaps", "reasoning"],
+        "required": ["verdict", "gaps", "anomaly_critique", "reasoning"],
     },
 }
 
-BEHAVIOR_SKEPTIC_SYSTEM_PROMPT = """You are reviewing a characterization of a system's behavior,
-written by another investigator based on testing so far. You have NOT seen the raw test data - only
-the characterization itself (its description of observed behavior and what it says is untested).
-Your job is to poke holes in it, not confirm it.
+SKEPTIC_SYSTEM_PROMPT = """You are cold-reviewing a checkpoint hypothesis - you have NOT seen the raw
+test data, only the hypothesis itself (its behavior characterization and any anomaly claims). Your
+job is to poke holes, not confirm.
 
-Assess whether this characterization is well-supported by what it claims to have tested, or
-premature/overconfident given the gaps. Identify at least 2 concrete gaps, untested areas, or weak
-assumptions. You are proposing what's worth investigating, not designing the actual tests yourself -
-a separate step (the Driver) decides what to test next, informed by your critique.
+Give a verdict: "weak" if the hypothesis is inadequately supported (whether that's an overconfident
+behavior characterization, an anomaly claim that isn't well justified, or a suspicious absence of any
+anomaly claim given what's been tested), or "strong_enough" only if you genuinely have no material
+objection. Identify at least 2 concrete gaps. If anomalies were claimed, give your own independent
+alternative explanation and assess whether each one's own competing explanation is genuine or a
+strawman - you propose what's worth investigating further, the Driver decides what to actually test.
 
-Call submit_behavior_skeptic_review with your answer."""
+Call submit_skeptic_review with your answer."""
 
 
-def validate_behavior_skeptic_review(data) -> list[str]:
+def validate_skeptic_response(data) -> list[str]:
     errors = []
     if not isinstance(data, dict):
         return [f"expected an object, got {type(data).__name__}"]
-
-    for key in ("assessment", "gaps", "reasoning"):
+    for key in ("verdict", "gaps", "anomaly_critique", "reasoning"):
         if key not in data:
             errors.append(f"missing required field '{key}'")
-
-    if data.get("assessment") not in ("well_supported", "premature"):
-        errors.append("'assessment' must be 'well_supported' or 'premature'")
-
+    if data.get("verdict") not in ("weak", "strong_enough"):
+        errors.append("'verdict' must be 'weak' or 'strong_enough'")
     gaps = data.get("gaps")
     if not isinstance(gaps, list) or len(gaps) < 2 or not all(isinstance(g, str) for g in gaps):
         errors.append("'gaps' must be a list of at least 2 strings")
-
     return errors
 
 
-def get_behavior_skeptic_review(client: Anthropic, behavior_hypothesis: dict) -> dict:
+def get_skeptic_review(client: Anthropic, hypothesis: dict) -> dict:
     evidence = {
-        "observed_behavior": behavior_hypothesis["observed_behavior"],
-        "untested_areas": behavior_hypothesis["untested_areas"],
+        "observed_behavior": hypothesis["observed_behavior"],
+        "anomalies": hypothesis["anomalies"],
+        "untested_areas": hypothesis["untested_areas"],
     }
     return call_tool_with_retry(
         client,
         model=MODEL,
-        system=BEHAVIOR_SKEPTIC_SYSTEM_PROMPT,
-        tools=[BEHAVIOR_SKEPTIC_TOOL],
-        tool_name="submit_behavior_skeptic_review",
+        system=SKEPTIC_SYSTEM_PROMPT,
+        tools=[SKEPTIC_TOOL],
+        tool_name="submit_skeptic_review",
         user_message=json.dumps(evidence, indent=2),
-        validate_fn=validate_behavior_skeptic_review,
+        validate_fn=validate_skeptic_response,
         max_tokens=1536,
     )
 
 
-def run_checkpoint_cycle(anthropic_client: Anthropic, happy_day_example: dict, test_counter):
-    """Casting broken into small checkpoints. Each checkpoint runs up to
-    ROUNDS_PER_CHECKPOINT rounds (same batch-propose-and-execute mechanism, same
-    early-exit the moment a test's burst shows more accepted requests than the
-    disclosed limit allows). If a checkpoint's rounds find nothing, the Driver is
-    forced to characterize the SUT's behavior so far and Skeptic critiques it -
-    guaranteeing Skeptic gets exercised even when discovery fails outright - and
-    that critique feeds into the next checkpoint's rounds.
+def run_checkpoint_loop(anthropic_client: Anthropic, happy_day_example: dict, test_counter):
+    """One consistent loop for the whole investigation - no hard split between
+    "blind discovery" and a separate "investigation" pipeline. Every checkpoint
+    proposes and executes a real batch of tests, then forms a hypothesis about the
+    system's behavior AND any anomalies noticed (zero, one, or several), which a
+    cold Skeptic reviews. "weak" sends the Driver into another checkpoint informed
+    by the critique; "strong_enough" ends the loop. Whether an anomaly is currently
+    believed to exist doesn't change the mechanism - Skeptic's verdict is what
+    decides whether to keep going, uniformly.
 
-    Returns (casting_log, anomaly_entry, gave_up, behavior_checkpoints).
+    Returns (casting_log, checkpoints, stopped_reason). checkpoints is a list of
+    {checkpoint, hypothesis, skeptic_review} in order - the last entry is the final
+    one used to decide whether to write bug reports.
     """
     casting_log = []
-    behavior_checkpoints = []
+    checkpoints = []
     prior_feedback = None
+    stopped_reason = "checkpoints_exhausted"
 
     for checkpoint_num in range(1, MAX_CHECKPOINTS + 1):
-        anomaly_entry = None
-        gave_up_this_checkpoint = False
+        is_first_checkpoint = checkpoint_num == 1
+        test_budget = FIRST_ROUND_TEST_BUDGET if is_first_checkpoint else DEFAULT_TEST_BUDGET
+        print(f"Asking Claude for a casting round (checkpoint {checkpoint_num}, budget {test_budget})...")
+        casting = get_casting_round(
+            anthropic_client,
+            happy_day_example,
+            casting_log,
+            prior_feedback,
+            test_budget=test_budget,
+            is_first_round=is_first_checkpoint,
+        )
 
-        for round_num in range(1, ROUNDS_PER_CHECKPOINT + 1):
-            is_very_first_round = checkpoint_num == 1 and round_num == 1
-            test_budget = FIRST_ROUND_TEST_BUDGET if is_very_first_round else DEFAULT_TEST_BUDGET
-            print(f"Asking Claude for a casting round (checkpoint {checkpoint_num}, round {round_num}, budget {test_budget})...")
-            casting = get_casting_round(
-                anthropic_client,
-                happy_day_example,
-                casting_log,
-                prior_feedback,
-                test_budget=test_budget,
-                is_first_round=is_very_first_round,
-            )
-            if casting["give_up"]:
-                print(f"  Claude gave up casting: {casting['reasoning']}")
-                gave_up_this_checkpoint = True
-                break
-
+        if casting["give_up"]:
+            print(f"  Claude gave up casting: {casting['reasoning']}")
+        else:
             print(f"  round reasoning: {casting['reasoning']}")
             for test in casting["candidate_tests"]:
                 linked = test["linked_hypothesis"]
@@ -621,517 +635,130 @@ def run_checkpoint_cycle(anthropic_client: Anthropic, happy_day_example: dict, t
                 print(f"  test #{test_number} ({label}): client_id={test['client_id']!r} request_count={test['request_count']} ({mode}) payload={test['payload']!r}")
 
                 result = execute_test(test, test_number)
-                entry = {
-                    "checkpoint": checkpoint_num,
-                    "round": round_num,
-                    "round_reasoning": casting["reasoning"],
-                    "linked_hypothesis": linked,
-                    **result,
-                }
-                casting_log.append(entry)
-
-                if result.get("skipped"):
-                    print("    refused as unsafe - no signal, continuing")
-                    continue
-
-                print(f"    accepted {result['accepted_count']}/{test['request_count']} (limit {result['limit']}) - {result['actual_correctness']}")
-                if result["actual_correctness"] == "overcounted" and anomaly_entry is None:
-                    print(f"    anomaly found ({label})")
-                    anomaly_entry = entry
-
-            if anomaly_entry is not None:
-                break
-
-        if anomaly_entry is not None:
-            return casting_log, anomaly_entry, False, behavior_checkpoints
-
-        print(f"Checkpoint {checkpoint_num}: nothing found, asking for a behavior hypothesis...")
-        behavior_hypothesis = get_behavior_hypothesis(anthropic_client, happy_day_example, casting_log)
-        print(f"  observed_behavior: {behavior_hypothesis['observed_behavior']}")
-
-        print("Asking behavior-Skeptic for a cold review...")
-        behavior_skeptic_review = get_behavior_skeptic_review(anthropic_client, behavior_hypothesis)
-        print(f"  assessment: {behavior_skeptic_review['assessment']}")
-
-        behavior_checkpoints.append(
-            {
-                "checkpoint": checkpoint_num,
-                "behavior_hypothesis": behavior_hypothesis,
-                "behavior_skeptic_review": behavior_skeptic_review,
-            }
-        )
-        prior_feedback = {
-            "behavior_hypothesis": behavior_hypothesis,
-            "behavior_skeptic_review": behavior_skeptic_review,
-        }
-
-    return casting_log, None, gave_up_this_checkpoint, behavior_checkpoints
-
-
-PATTERN_TOOL = {
-    "name": "submit_hypothesis",
-    "description": "Submit your falsifiable claim about the anomaly, plus a genuine competing explanation and real confirm/disconfirm tests.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "observed_pattern": {"type": "string", "description": "How the system has behaved overall, across everything tested so far."},
-            "anomalous_test_number": {"type": "integer", "description": "The test_number of the test that revealed the anomaly."},
-            "claim": {"type": "string", "description": "Your specific, falsifiable explanation for why that test overcounted accepted requests."},
-            "competing_explanation": {"type": "string", "description": "A genuine rival explanation for the same observation - not a strawman you'd easily dismiss."},
-            "severity_if_true": {"type": "string", "enum": ["low", "medium", "high"]},
-            "confirm_test": {
-                "type": "object",
-                "properties": {
-                    "client_id": {"type": "string"},
-                    "payload": {"type": "string"},
-                    "priority": {"type": "string", "enum": ["normal", "high"]},
-                    "request_count": {"type": "integer"},
-                    "concurrent": {"type": "boolean", "description": "true = all requests fired at once; false = sent one at a time, each waiting for the previous response."},
-                    "predicted_outcome": {"type": "string"},
-                    "predicted_correctness": {"type": "string", "enum": ["correct", "overcounted"]},
-                },
-                "required": ["client_id", "payload", "priority", "request_count", "concurrent", "predicted_outcome", "predicted_correctness"],
-                "description": "A test designed to reproduce the anomaly again, isolated from anything else.",
-            },
-            "disconfirm_test": {
-                "type": "object",
-                "properties": {
-                    "client_id": {"type": "string"},
-                    "payload": {"type": "string"},
-                    "priority": {"type": "string", "enum": ["normal", "high"]},
-                    "request_count": {"type": "integer"},
-                    "concurrent": {"type": "boolean", "description": "true = all requests fired at once; false = sent one at a time, each waiting for the previous response."},
-                    "predicted_outcome": {"type": "string"},
-                    "predicted_correctness": {"type": "string", "enum": ["correct", "overcounted"]},
-                },
-                "required": ["client_id", "payload", "priority", "request_count", "concurrent", "predicted_outcome", "predicted_correctness"],
-                "description": (
-                    "A test genuinely designed to try to PROVE YOUR CLAIM WRONG - not a weaker version of the "
-                    "confirm test. If your claim is specifically that CONCURRENCY causes the bug, a genuine "
-                    "disconfirm test needs concurrent=false with request_count > 1 (a real sequential test, not "
-                    "just one request) - that's the only way to check whether the same misbehavior happens "
-                    "even without concurrency, which would refute a concurrency-specific claim."
-                ),
-            },
-        },
-        "required": ["observed_pattern", "anomalous_test_number", "claim", "competing_explanation", "severity_if_true", "confirm_test", "disconfirm_test"],
-    },
-}
-
-SYSTEM_PROMPT = """You found a test in this session whose burst showed more accepted requests than
-the disclosed rate limit allows. Now form a specific, falsifiable claim about WHY - not just "the
-rate limit is broken" but the actual mechanism (e.g. a check-then-act race condition, a counter that
-isn't updated atomically, etc).
-
-You must also propose a genuine competing explanation - a real rival hypothesis, not a strawman you'd
-easily dismiss (e.g. "it was a fluke/random server load" is a fair rival unless you can rule it out).
-
-Design a confirm_test that should reproduce the anomaly, and a disconfirm_test that genuinely tries to
-prove your claim WRONG - not a weaker version of the same test. Both will be executed for real.
-
-Call submit_hypothesis with your answer."""
-
-
-def validate_hypothesis(data) -> list[str]:
-    errors = []
-    if not isinstance(data, dict):
-        return [f"expected an object, got {type(data).__name__}"]
-    for key in ("observed_pattern", "anomalous_test_number", "claim", "competing_explanation", "severity_if_true", "confirm_test", "disconfirm_test"):
-        if key not in data:
-            errors.append(f"missing required field '{key}'")
-    if data.get("severity_if_true") not in ("low", "medium", "high"):
-        errors.append("'severity_if_true' must be low/medium/high")
-    for test_key in ("confirm_test", "disconfirm_test"):
-        test = data.get(test_key)
-        if not isinstance(test, dict):
-            errors.append(f"'{test_key}' must be an object")
-            continue
-        for field in ("client_id", "payload", "priority", "request_count", "concurrent", "predicted_outcome", "predicted_correctness"):
-            if field not in test:
-                errors.append(f"'{test_key}' missing '{field}'")
-        if test.get("predicted_correctness") not in ("correct", "overcounted"):
-            errors.append(f"'{test_key}.predicted_correctness' must be 'correct' or 'overcounted'")
-    return errors
-
-
-def get_hypothesis(client: Anthropic, happy_day_example: dict, casting_log: list[dict]) -> dict:
-    evidence = {
-        "api_schema": API_SCHEMA_DOC,
-        "happy_day_example": happy_day_example,
-        "all_tests_this_session": redact_history_for_model(casting_log),
-    }
-    return call_tool_with_retry(
-        client,
-        model=MODEL,
-        system=SYSTEM_PROMPT,
-        tools=[PATTERN_TOOL],
-        tool_name="submit_hypothesis",
-        user_message=json.dumps(evidence, indent=2),
-        validate_fn=validate_hypothesis,
-        max_tokens=2048,
-    )
-
-
-INVESTIGATION_CHECKPOINT_SYSTEM_PROMPT = """Skeptic has cold-reviewed your claim and found it weak.
-Before writing a revised claim, gather more real evidence: propose a batch of NEW tests (up to 6)
-specifically designed to address Skeptic's critique - operationalize Skeptic's disproof_strategies
-into literal tests, and/or design tests that would distinguish your claim from Skeptic's own
-alternative explanation. You are not revising the claim in this step, only gathering evidence that
-a later step will use to re-form it - a stronger claim has to come from new data, not just better
-wording of the same data.
-
-Don't repeat a test that's already been tried with a consistent result (check
-tests_tried_so_far) - every test in this batch should be capable of actually shifting the picture
-one way or the other. All tests will be executed for real before you see results.
-
-If you genuinely have no new test that could add evidence beyond what's already been tried, set
-give_up to true rather than proposing something arbitrary.
-
-Call submit_casting_round with your answer."""
-
-
-def get_investigation_checkpoint_round(
-    client: Anthropic, happy_day_example: dict, hypothesis: dict, skeptic_review: dict, casting_log: list[dict]
-) -> dict:
-    evidence = {
-        "api_schema": API_SCHEMA_DOC,
-        "happy_day_example": happy_day_example,
-        "your_claim": hypothesis["claim"],
-        "your_competing_explanation": hypothesis["competing_explanation"],
-        "skeptics_critique": skeptic_review,
-        "tests_tried_so_far": redact_history_for_model(casting_log),
-    }
-    return call_tool_with_retry(
-        client,
-        model=MODEL,
-        system=INVESTIGATION_CHECKPOINT_SYSTEM_PROMPT,
-        tools=[CASTING_TOOL],
-        tool_name="submit_casting_round",
-        user_message=json.dumps(evidence, indent=2),
-        validate_fn=validate_casting_response,
-        max_tokens=3072,
-    )
-
-
-SKEPTIC_TOOL = {
-    "name": "submit_skeptic_review",
-    "description": "Cold-review a claim and its competing explanation - you have NOT seen the underlying test data.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "skeptic_verdict": {"type": "string", "enum": ["holds_up", "weak"]},
-            "competing_explanation_assessment": {"type": "string", "enum": ["genuine", "strawman"]},
-            "skeptic_alternative": {"type": "string", "description": "Your own independent alternative explanation, not a restatement of the given competing explanation."},
-            "disproof_strategies": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "At least 2-3 concrete strategies for trying to disprove the claim.",
-                "minItems": 2,
-            },
-            "reasoning": {"type": "string"},
-        },
-        "required": ["skeptic_verdict", "competing_explanation_assessment", "skeptic_alternative", "disproof_strategies", "reasoning"],
-    },
-}
-
-SKEPTIC_SYSTEM_PROMPT = """You are cold-reviewing a claim and its competing explanation. You have NOT
-seen the underlying test data - only the claim and competing explanation themselves. Your job is to
-poke holes, not confirm.
-
-Assess whether the claim holds up or is weak given what it's actually built on. Assess whether the
-given competing explanation is genuine or a strawman. Propose your OWN independent alternative
-explanation - not a restatement of the one given. Propose at least 2-3 concrete disproof strategies -
-you propose what's worth trying, the Driver decides what to actually test.
-
-Call submit_skeptic_review with your answer."""
-
-
-def validate_skeptic_review(data) -> list[str]:
-    errors = []
-    if not isinstance(data, dict):
-        return [f"expected an object, got {type(data).__name__}"]
-    for key in ("skeptic_verdict", "competing_explanation_assessment", "skeptic_alternative", "disproof_strategies", "reasoning"):
-        if key not in data:
-            errors.append(f"missing required field '{key}'")
-    if data.get("skeptic_verdict") not in ("holds_up", "weak"):
-        errors.append("'skeptic_verdict' must be 'holds_up' or 'weak'")
-    if data.get("competing_explanation_assessment") not in ("genuine", "strawman"):
-        errors.append("'competing_explanation_assessment' must be 'genuine' or 'strawman'")
-    strategies = data.get("disproof_strategies")
-    if not isinstance(strategies, list) or len(strategies) < 2 or not all(isinstance(s, str) for s in strategies):
-        errors.append("'disproof_strategies' must be a list of at least 2 strings")
-    return errors
-
-
-def get_skeptic_review(client: Anthropic, claim: str, competing_explanation: str) -> dict:
-    evidence = {"claim": claim, "competing_explanation": competing_explanation}
-    return call_tool_with_retry(
-        client,
-        model=MODEL,
-        system=SKEPTIC_SYSTEM_PROMPT,
-        tools=[SKEPTIC_TOOL],
-        tool_name="submit_skeptic_review",
-        user_message=json.dumps(evidence, indent=2),
-        validate_fn=validate_skeptic_review,
-        max_tokens=1536,
-    )
-
-
-FOLLOWUP_TOOL = {
-    "name": "submit_followup",
-    "description": "Give a verdict on the claim given everything so far, and (if continuing) the next test to run.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "verdict": {"type": "string", "enum": ["corroborated", "refuted", "inconclusive"]},
-            "reasoning": {"type": "string"},
-            "continue_investigation": {"type": "boolean"},
-            "next_test": {
-                "type": "object",
-                "properties": {
-                    "client_id": {"type": "string"},
-                    "payload": {"type": "string"},
-                    "priority": {"type": "string", "enum": ["normal", "high"]},
-                    "request_count": {"type": "integer"},
-                    "concurrent": {"type": "boolean", "description": "true = all requests fired at once; false = sent one at a time, each waiting for the previous response."},
-                    "predicted_outcome": {"type": "string"},
-                    "predicted_correctness": {"type": "string", "enum": ["correct", "overcounted"]},
-                },
-                "required": ["client_id", "payload", "priority", "request_count", "concurrent", "predicted_outcome", "predicted_correctness"],
-                "description": "Required if continue_investigation is true, omitted otherwise.",
-            },
-        },
-        "required": ["verdict", "reasoning", "continue_investigation"],
-    },
-}
-
-FOLLOWUP_SYSTEM_PROMPT = f"""Given the claim, Skeptic's review, and the real confirm/disconfirm/
-follow-up results so far, give your verdict: corroborated, refuted, or inconclusive. Consider
-Skeptic's disproof_strategies as ideas for what to test next, though you decide the actual test.
-
-Remember concurrent and request_count are independent: concurrent=true fires every request at the
-same moment (the only way to test shared-state safety under real concurrency); concurrent=false
-sends them one at a time, each waiting for the previous response (a genuine sequential test, not
-the same as a single request repeated). If you need to check whether a concurrency-specific claim
-would also fail sequentially, that requires concurrent=false with request_count > 1 - a single
-request can't answer that question.
-
-Requests larger than {MAX_REQUEST_COUNT} get refused rather than executed - if an earlier test was
-refused for that reason and you still want to pursue it, try a smaller request_count.
-
-If continue_investigation is true, propose the single next test that would most efficiently refine
-the verdict. If you're satisfied either way (corroborated with enough evidence, or refuted), set
-continue_investigation to false and omit next_test.
-
-Call submit_followup with your answer."""
-
-
-def validate_followup(data) -> list[str]:
-    errors = []
-    if not isinstance(data, dict):
-        return [f"expected an object, got {type(data).__name__}"]
-    for key in ("verdict", "reasoning", "continue_investigation"):
-        if key not in data:
-            errors.append(f"missing required field '{key}'")
-    if data.get("verdict") not in ("corroborated", "refuted", "inconclusive"):
-        errors.append("'verdict' must be corroborated/refuted/inconclusive")
-    if data.get("continue_investigation") is True:
-        next_test = data.get("next_test")
-        if not isinstance(next_test, dict):
-            errors.append("'next_test' is required (as an object) when continue_investigation is true")
-        else:
-            for field in ("client_id", "payload", "priority", "request_count", "concurrent", "predicted_outcome", "predicted_correctness"):
-                if field not in next_test:
-                    errors.append(f"'next_test' missing '{field}'")
-            if next_test.get("predicted_correctness") not in ("correct", "overcounted"):
-                errors.append("'next_test.predicted_correctness' must be 'correct' or 'overcounted'")
-    return errors
-
-
-def get_followup(client: Anthropic, hypothesis: dict, skeptic_review: dict, history: list[dict]) -> dict:
-    evidence = {
-        "claim": hypothesis["claim"],
-        "competing_explanation": hypothesis["competing_explanation"],
-        "skeptic_review": skeptic_review,
-        "history": history,
-    }
-    return call_tool_with_retry(
-        client,
-        model=MODEL,
-        system=FOLLOWUP_SYSTEM_PROMPT,
-        tools=[FOLLOWUP_TOOL],
-        tool_name="submit_followup",
-        user_message=json.dumps(evidence, indent=2),
-        validate_fn=validate_followup,
-        max_tokens=1536,
-    )
-
-
-def run_investigation(
-    anthropic_client: Anthropic, happy_day_example: dict, casting_log: list[dict], test_counter, starting_checkpoint: int
-) -> dict:
-    """Everything that happens once an anomaly has been found: hypothesis formation,
-    a cold Skeptic review, real confirm/disconfirm execution, and a bounded
-    follow-up loop informed by real outcomes and by Skeptic's disproof strategies.
-
-    Skeptic's initial review is a real gate, not just advisory context for later:
-    a "weak" verdict sends the Driver back into a genuine investigation checkpoint -
-    propose and EXECUTE a new batch of real tests targeting Skeptic's specific
-    critique, exactly like a Phase A checkpoint - before the hypothesis is re-formed
-    from the expanded evidence and confirm/disconfirm ever runs. Just asking the
-    Driver to reword the same claim against the same data (an earlier version of
-    this) never actually tests anything new - a stronger claim has to come from new
-    evidence, not better wording of the old evidence. Bounded by
-    MAX_HYPOTHESIS_ATTEMPTS total attempts so this can't loop forever on cost.
-    starting_checkpoint continues the numbering from wherever Phase A's casting
-    stopped, so these show up as further checkpoints in the same sequence."""
-    result = {}
-
-    print("Asking Claude for a hypothesis...")
-    hypothesis = get_hypothesis(anthropic_client, happy_day_example, casting_log)
-
-    hypothesis_attempts = []
-    skeptic_review = None
-    for attempt in range(1, MAX_HYPOTHESIS_ATTEMPTS + 1):
-        print(f"Asking Skeptic for a cold review (attempt {attempt}, claim + competing_explanation only)...")
-        skeptic_review = get_skeptic_review(anthropic_client, hypothesis["claim"], hypothesis["competing_explanation"])
-        print(f"  skeptic verdict: {skeptic_review['skeptic_verdict']}, competing_explanation assessed as: {skeptic_review['competing_explanation_assessment']}")
-        hypothesis_attempts.append({"hypothesis": hypothesis, "skeptic_review": skeptic_review})
-
-        if skeptic_review["skeptic_verdict"] == "holds_up" or attempt == MAX_HYPOTHESIS_ATTEMPTS:
-            break
-
-        checkpoint_num = starting_checkpoint + attempt
-        print(f"  Skeptic found the hypothesis weak - running investigation checkpoint {checkpoint_num} to gather more evidence...")
-        checkpoint_round = get_investigation_checkpoint_round(anthropic_client, happy_day_example, hypothesis, skeptic_review, casting_log)
-
-        if checkpoint_round["give_up"]:
-            print(f"  Driver had no new tests to propose: {checkpoint_round['reasoning']}")
-        else:
-            print(f"  checkpoint reasoning: {checkpoint_round['reasoning']}")
-            for test in checkpoint_round["candidate_tests"]:
-                linked = test["linked_hypothesis"]
-                label = f"hypothesis: {linked}" if linked else "edge case"
-                test_number = next(test_counter)
-                mode = "concurrent" if test["concurrent"] else "sequential"
-                print(f"  test #{test_number} ({label}): client_id={test['client_id']!r} request_count={test['request_count']} ({mode}) payload={test['payload']!r}")
-
-                test_result = execute_test(test, test_number)
                 casting_log.append({
                     "checkpoint": checkpoint_num,
                     "round": 1,
-                    "round_reasoning": checkpoint_round["reasoning"],
+                    "round_reasoning": casting["reasoning"],
                     "linked_hypothesis": linked,
-                    **test_result,
+                    **result,
                 })
-                if test_result.get("skipped"):
+                if result.get("skipped"):
                     print("    refused as unsafe - no signal, continuing")
                 else:
-                    print(f"    accepted {test_result['accepted_count']}/{test['request_count']} (limit {test_result['limit']}) - {test_result['actual_correctness']}")
+                    print(f"    accepted {result['accepted_count']}/{test['request_count']} (limit {result['limit']}) - {result['actual_correctness']}")
 
-        print("Asking Claude for a revised hypothesis given the new evidence...")
-        hypothesis = get_hypothesis(anthropic_client, happy_day_example, casting_log)
+        print(f"Checkpoint {checkpoint_num}: forming a hypothesis...")
+        hypothesis = get_checkpoint_hypothesis(anthropic_client, happy_day_example, casting_log)
+        print(f"  observed_behavior: {hypothesis['observed_behavior']}")
+        print(f"  anomalies noticed: {len(hypothesis['anomalies'])}")
 
-    result["hypothesis"] = hypothesis
-    result["skeptic_review"] = skeptic_review
-    result["hypothesis_attempts"] = hypothesis_attempts
+        print("Asking Skeptic for a cold review...")
+        skeptic_review = get_skeptic_review(anthropic_client, hypothesis)
+        print(f"  skeptic verdict: {skeptic_review['verdict']}")
 
-    print("Executing confirm_test against the live SUT...")
-    confirm_result = execute_test(hypothesis["confirm_test"], next(test_counter))
-    result["confirm_result"] = confirm_result
+        checkpoints.append({"checkpoint": checkpoint_num, "hypothesis": hypothesis, "skeptic_review": skeptic_review})
 
-    print("Executing disconfirm_test against the live SUT...")
-    disconfirm_result = execute_test(hypothesis["disconfirm_test"], next(test_counter))
-    result["disconfirm_result"] = disconfirm_result
-
-    history = [
-        {"round": "confirm_test", **confirm_result},
-        {"round": "disconfirm_test", **disconfirm_result},
-    ]
-    followup_rounds = []
-    stopped_reason = "round_cap_reached"
-    for round_num in range(1, MAX_FOLLOWUP_ROUNDS + 1):
-        print(f"Asking Claude for a verdict + follow-up (round {round_num})...")
-        followup = get_followup(anthropic_client, hypothesis, skeptic_review, history)
-        print(f"  verdict: {followup['verdict']} - continue: {followup['continue_investigation']}")
-
-        round_entry = {
-            "verdict": followup["verdict"],
-            "reasoning": followup["reasoning"],
-            "continue_investigation": followup["continue_investigation"],
-        }
-        if not followup["continue_investigation"]:
-            followup_rounds.append(round_entry)
-            stopped_reason = "satisfied"
+        if skeptic_review["verdict"] == "strong_enough":
+            stopped_reason = "skeptic_satisfied"
             break
 
-        print(f"  executing follow-up test (round {round_num})...")
-        test_result = execute_test(followup["next_test"], next(test_counter))
-        round_entry["test_result"] = test_result
-        followup_rounds.append(round_entry)
-        history.append({"round": f"followup_{round_num}", **test_result})
+        prior_feedback = {"hypothesis": hypothesis, "skeptic_review": skeptic_review}
 
-    result["followup_rounds"] = followup_rounds
-    result["followup_stopped_reason"] = stopped_reason
-    return result
+    return casting_log, checkpoints, stopped_reason
 
 
 BUG_REPORT_TOOL = {
-    "name": "submit_bug_report",
-    "description": "Write the final bug report - deliberately NOT redacted, since this needs real repro steps.",
+    "name": "submit_bug_reports",
+    "description": "Write the final bug report(s) - deliberately NOT redacted, since this needs real repro steps. One entry per distinct anomaly.",
     "input_schema": {
         "type": "object",
         "properties": {
-            "title": {"type": "string"},
-            "description": {"type": "string"},
-            "steps_to_reproduce": {"type": "array", "items": {"type": "string"}, "minItems": 1},
-            "expected_behavior": {"type": "string"},
-            "actual_behavior": {"type": "string"},
-            "severity": {"type": "string", "enum": ["low", "medium", "high"]},
-            "status": {"type": "string", "enum": ["corroborated", "refuted", "inconclusive"]},
-            "caveats": {"type": "string", "description": "Honest caveats about what wasn't resolved or verified."},
+            "bugs": {
+                "type": "array",
+                "description": "One entry per distinct anomaly in the final hypothesis.",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "description": {"type": "string"},
+                        "steps_to_reproduce": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                        "expected_behavior": {"type": "string"},
+                        "actual_behavior": {"type": "string"},
+                        "severity": {"type": "string", "enum": ["low", "medium", "high"]},
+                        "status": {
+                            "type": "string",
+                            "enum": ["corroborated", "inconclusive"],
+                            "description": "'corroborated' if Skeptic was satisfied; 'inconclusive' if the checkpoint budget ran out while Skeptic still had objections.",
+                        },
+                        "caveats": {"type": "string", "description": "Honest caveats about what wasn't resolved or verified."},
+                    },
+                    "required": ["title", "description", "steps_to_reproduce", "expected_behavior", "actual_behavior", "severity", "status", "caveats"],
+                },
+            },
         },
-        "required": ["title", "description", "steps_to_reproduce", "expected_behavior", "actual_behavior", "severity", "status", "caveats"],
+        "required": ["bugs"],
     },
 }
 
-BUG_REPORT_SYSTEM_PROMPT = """Write the final bug report for this investigation, based on everything
-in the evidence: the claim, Skeptic's review, and the real confirm/disconfirm/follow-up results.
-Include literal, concrete repro steps (real client_id/payload/request_count/concurrent values that
-actually reproduced the issue) - this report needs to be independently actionable, not a redacted summary.
-Be honest in caveats about anything that wasn't fully resolved or verified.
+BUG_REPORT_SYSTEM_PROMPT = """Write the final bug report(s) based on everything in the evidence: the
+final checkpoint hypothesis (including its anomaly claims), Skeptic's critique, stopped_reason, and
+the full test history. Write ONE entry per distinct anomaly claimed in the final hypothesis. Include
+literal, concrete repro steps (real client_id/payload/request_count/concurrent values that actually
+reproduced the issue, referencing real test numbers) - each report needs to be independently
+actionable, not a redacted summary. Be honest in caveats about anything that wasn't fully resolved -
+if the checkpoint budget ran out while Skeptic still had objections (stopped_reason is
+"checkpoints_exhausted"), say so explicitly rather than overstating confidence, and set status to
+"inconclusive" rather than "corroborated".
 
-Call submit_bug_report with your answer."""
+Call submit_bug_reports with your answer."""
 
 
-def validate_bug_report(data) -> list[str]:
+def validate_bug_reports(data) -> list[str]:
     errors = []
     if not isinstance(data, dict):
         return [f"expected an object, got {type(data).__name__}"]
-    for key in ("title", "description", "steps_to_reproduce", "expected_behavior", "actual_behavior", "severity", "status", "caveats"):
-        if key not in data:
-            errors.append(f"missing required field '{key}'")
-    steps = data.get("steps_to_reproduce")
-    if not isinstance(steps, list) or not steps or not all(isinstance(s, str) for s in steps):
-        errors.append("'steps_to_reproduce' must be a non-empty list of strings")
-    if data.get("severity") not in ("low", "medium", "high"):
-        errors.append("'severity' must be low/medium/high")
-    if data.get("status") not in ("corroborated", "refuted", "inconclusive"):
-        errors.append("'status' must be corroborated/refuted/inconclusive")
+    bugs = data.get("bugs")
+    if not isinstance(bugs, list) or not bugs:
+        errors.append("'bugs' must be a non-empty list")
+        return errors
+    for i, bug in enumerate(bugs):
+        if not isinstance(bug, dict):
+            errors.append(f"bugs[{i}] must be an object")
+            continue
+        for key in ("title", "description", "steps_to_reproduce", "expected_behavior", "actual_behavior", "severity", "status", "caveats"):
+            if key not in bug:
+                errors.append(f"bugs[{i}] missing '{key}'")
+        steps = bug.get("steps_to_reproduce")
+        if not isinstance(steps, list) or not steps or not all(isinstance(s, str) for s in steps):
+            errors.append(f"bugs[{i}].steps_to_reproduce must be a non-empty list of strings")
+        if bug.get("severity") not in ("low", "medium", "high"):
+            errors.append(f"bugs[{i}].severity must be low/medium/high")
+        if bug.get("status") not in ("corroborated", "inconclusive"):
+            errors.append(f"bugs[{i}].status must be 'corroborated' or 'inconclusive'")
     return errors
 
 
-def get_bug_report(client: Anthropic, investigation: dict) -> dict:
-    return call_tool_with_retry(
+def get_bug_reports(
+    client: Anthropic, final_hypothesis: dict, final_skeptic_review: dict, stopped_reason: str, casting_log: list[dict]
+) -> list[dict]:
+    evidence = {
+        "final_hypothesis": final_hypothesis,
+        "final_skeptic_review": final_skeptic_review,
+        "stopped_reason": stopped_reason,
+        "all_tests_this_session": redact_history_for_model(casting_log),
+    }
+    result = call_tool_with_retry(
         client,
         model=MODEL,
         system=BUG_REPORT_SYSTEM_PROMPT,
         tools=[BUG_REPORT_TOOL],
-        tool_name="submit_bug_report",
-        user_message=json.dumps(investigation, indent=2),
-        validate_fn=validate_bug_report,
-        max_tokens=2048,
+        tool_name="submit_bug_reports",
+        user_message=json.dumps(evidence, indent=2),
+        validate_fn=validate_bug_reports,
+        max_tokens=3072,
     )
+    return result["bugs"]
 
 
 def main():
@@ -1160,28 +787,27 @@ def main():
     print(f"  {happy_day_example['request']['body']} -> {happy_day_example['response']['body']}")
 
     output = {"api_schema": API_SCHEMA_DOC, "happy_day_example": happy_day_example}
-    bug_report = None
+    bug_reports = []
     test_counter = itertools.count(1)
     try:
-        casting_log, anomaly_entry, gave_up, behavior_checkpoints = run_checkpoint_cycle(
-            anthropic_client, happy_day_example, test_counter
-        )
+        casting_log, checkpoints, stopped_reason = run_checkpoint_loop(anthropic_client, happy_day_example, test_counter)
         output["casting_log"] = casting_log
-        output["behavior_checkpoints"] = behavior_checkpoints
+        output["checkpoints"] = checkpoints
+        output["stopped_reason"] = stopped_reason
 
-        if anomaly_entry is None:
-            output["anomaly_found"] = False
-            output["casting_stopped_reason"] = "gave_up" if gave_up else "checkpoints_exhausted"
-        else:
-            output["anomaly_found"] = True
-            output.update(run_investigation(anthropic_client, happy_day_example, casting_log, test_counter, anomaly_entry["checkpoint"]))
+        final_hypothesis = checkpoints[-1]["hypothesis"]
+        final_skeptic_review = checkpoints[-1]["skeptic_review"]
+        anomalies = final_hypothesis.get("anomalies", [])
+        output["anomaly_found"] = len(anomalies) > 0
 
-            print("Writing bug report...")
-            bug_report = get_bug_report(anthropic_client, output)
+        if anomalies:
+            plural = "y" if len(anomalies) == 1 else "ies"
+            print(f"Writing bug report(s) for {len(anomalies)} anomal{plural}...")
+            bug_reports = get_bug_reports(anthropic_client, final_hypothesis, final_skeptic_review, stopped_reason, casting_log)
             bugs_path = out_dir / "bugs.json"
             out_dir.mkdir(exist_ok=True)
-            bugs_path.write_text(json.dumps(bug_report, indent=2))
-            print(f"Wrote bug report to {bugs_path}")
+            bugs_path.write_text(json.dumps(bug_reports, indent=2))
+            print(f"Wrote {len(bug_reports)} bug report(s) to {bugs_path}")
 
     except RuntimeError as e:
         print(f"Stopped early: {e}")
@@ -1190,14 +816,14 @@ def main():
     write_output(output)
 
     report_path = out_dir / "report.html"
-    report_path.write_text(render_report(output, bug_report), encoding="utf-8")
+    report_path.write_text(render_report(output, bug_reports), encoding="utf-8")
     print(f"Wrote report to {report_path}")
 
     if "error" not in output:
         if output.get("anomaly_found"):
             print("Now score it by hand against rubric.md.")
         else:
-            print("No anomaly found. See behavior_checkpoints for the final behavior hypothesis and Skeptic's critique of it.")
+            print("No anomaly found. See checkpoints for the final hypothesis and Skeptic's critique of it.")
 
 
 if __name__ == "__main__":
