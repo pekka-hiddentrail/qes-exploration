@@ -45,9 +45,8 @@ SUT_URL = "http://127.0.0.1:8000/purchase"
 SUT_DOCS_URL = "http://127.0.0.1:8000/docs"
 SUT_READY_TIMEOUT = 5.0
 
-# Intentionally minimal for now, to keep the first real run cheap while we confirm
-# the harness and SUT work end to end - raise this once we're ready for deeper runs.
-MAX_CHECKPOINTS = 1
+# Raised from 1 after the first run confirmed the harness and SUT work end to end.
+MAX_CHECKPOINTS = 4
 
 FIRST_ROUND_TEST_BUDGET = 10
 DEFAULT_TEST_BUDGET = 6
