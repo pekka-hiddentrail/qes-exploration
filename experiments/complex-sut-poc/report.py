@@ -278,6 +278,35 @@ def _render_followup_rounds(followup_rounds) -> str:
     return "".join(parts)
 
 
+def _render_hypothesis_attempts(attempts) -> str:
+    """Only the attempts Skeptic rejected before the one actually used - the final
+    attempt is already shown in the main Claim/Skeptic exhibits below, so
+    repeating it here would be redundant."""
+    rejected = attempts[:-1] if len(attempts) > 1 else []
+    if not rejected:
+        return ""
+    parts = []
+    for i, attempt in enumerate(rejected, start=1):
+        h = attempt["hypothesis"]
+        sr = attempt["skeptic_review"]
+        parts.append(f"""
+        <div class="exhibit">
+          <p class="eyebrow">Hypothesis attempt {i} {_verdict_badge(sr.get('skeptic_verdict'))} &middot; sent back for revision</p>
+          <p><strong>Claim</strong></p>
+          <div class="prose">{_render_prose(h.get('claim'))}</div>
+          <p><strong>Why Skeptic rejected it</strong></p>
+          <div class="prose prose-muted">{_render_prose(sr.get('reasoning'))}</div>
+        </div>
+        """)
+    return f"""
+    <div class="checkpoint">
+      <h3>Hypothesis revisions</h3>
+      <p class="prose-muted">Skeptic found the initial claim(s) too weak to spend test budget on - the Driver had to revise before confirm/disconfirm ran.</p>
+      {''.join(parts)}
+    </div>
+    """
+
+
 def _render_investigation_section(output) -> str:
     hypothesis = output.get("hypothesis")
     if not hypothesis:
@@ -285,14 +314,19 @@ def _render_investigation_section(output) -> str:
 
     skeptic = output.get("skeptic_review", {})
     strategies = "".join(f"<li>{_inline_markdown(s)}</li>" for s in skeptic.get("disproof_strategies", []))
+    attempts = output.get("hypothesis_attempts", [])
+    revisions_html = _render_hypothesis_attempts(attempts)
+    claim_heading = "Claim (final, after revision)" if len(attempts) > 1 else "Claim"
 
     return f"""
     <section id="investigation">
       <p class="eyebrow">Phase 3</p>
       <h2>Investigation</h2>
 
+      {revisions_html}
+
       <div class="exhibit">
-        <h3>Claim</h3>
+        <h3>{claim_heading}</h3>
         <p><strong>Observed pattern</strong></p>
         <div class="prose">{_render_prose(hypothesis.get('observed_pattern'))}</div>
         <p><strong>Anomalous test number</strong><br><span class="num">{_esc(hypothesis.get('anomalous_test_number'))}</span></p>

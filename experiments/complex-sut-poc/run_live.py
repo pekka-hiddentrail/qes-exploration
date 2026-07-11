@@ -55,6 +55,15 @@ ROUNDS_PER_CHECKPOINT = 2
 MAX_CHECKPOINTS = 2
 MAX_FOLLOWUP_ROUNDS = 2
 
+# Total hypothesis attempts (initial + revisions) before proceeding to
+# confirm/disconfirm regardless of Skeptic's verdict. Without this cap, a
+# "weak" verdict on the initial claim only ever fed into the *optional*
+# follow-up loop, after confirm/disconfirm tests chosen before Skeptic saw
+# anything had already spent the test budget - Skeptic's verdict had no actual
+# power to stop a shaky claim from being tested as-is. Now a "weak" verdict
+# sends the Driver back to revise before any real test budget is spent.
+MAX_HYPOTHESIS_ATTEMPTS = 2
+
 # The very first round is the only genuinely "know nothing" moment - nothing has
 # been tested or ruled out yet, so it's the right place to spend extra breadth.
 FIRST_ROUND_TEST_BUDGET = 10
@@ -763,6 +772,42 @@ def get_hypothesis(client: Anthropic, happy_day_example: dict, casting_log: list
     )
 
 
+REVISE_HYPOTHESIS_SYSTEM_PROMPT = """Skeptic has cold-reviewed your claim and found it weak - before
+any real test budget is spent on confirm/disconfirm, you must revise.
+
+Directly address what Skeptic found weak: either strengthen the justification for the SAME claim if
+you still believe it's right (engage specifically with Skeptic's reasoning, don't just restate the
+claim), or pivot to a different, better-supported claim informed by Skeptic's own alternative
+explanation and disproof strategies. Design new confirm_test and disconfirm_test that reflect
+whatever claim you land on - don't resubmit the same tests unchanged if the claim itself changed, and
+make sure the disconfirm test could genuinely refute the (possibly revised) claim, not a strawman of
+it.
+
+Call submit_hypothesis with your revised answer."""
+
+
+def revise_hypothesis(
+    client: Anthropic, happy_day_example: dict, casting_log: list[dict], prior_hypothesis: dict, skeptic_review: dict
+) -> dict:
+    evidence = {
+        "api_schema": API_SCHEMA_DOC,
+        "happy_day_example": happy_day_example,
+        "all_tests_this_session": redact_history_for_model(casting_log),
+        "your_prior_hypothesis": prior_hypothesis,
+        "skeptics_critique": skeptic_review,
+    }
+    return call_tool_with_retry(
+        client,
+        model=MODEL,
+        system=REVISE_HYPOTHESIS_SYSTEM_PROMPT,
+        tools=[PATTERN_TOOL],
+        tool_name="submit_hypothesis",
+        user_message=json.dumps(evidence, indent=2),
+        validate_fn=validate_hypothesis,
+        max_tokens=2048,
+    )
+
+
 SKEPTIC_TOOL = {
     "name": "submit_skeptic_review",
     "description": "Cold-review a claim and its competing explanation - you have NOT seen the underlying test data.",
@@ -920,17 +965,38 @@ def get_followup(client: Anthropic, hypothesis: dict, skeptic_review: dict, hist
 def run_investigation(anthropic_client: Anthropic, happy_day_example: dict, casting_log: list[dict], test_counter) -> dict:
     """Everything that happens once an anomaly has been found: hypothesis formation,
     a cold Skeptic review, real confirm/disconfirm execution, and a bounded
-    follow-up loop informed by real outcomes and by Skeptic's disproof strategies."""
+    follow-up loop informed by real outcomes and by Skeptic's disproof strategies.
+
+    Skeptic's initial review is a real gate, not just advisory context for later:
+    a "weak" verdict sends the Driver back to revise the claim (and its
+    confirm/disconfirm tests) before any real test budget is spent, up to
+    MAX_HYPOTHESIS_ATTEMPTS total attempts. Without this, confirm/disconfirm tests
+    chosen before Skeptic ever saw the claim would execute regardless of the
+    verdict, and "weak" only ever reached the Driver as one more piece of context
+    in the optional follow-up loop - after the tests it should have prevented had
+    already run."""
     result = {}
 
     print("Asking Claude for a hypothesis...")
     hypothesis = get_hypothesis(anthropic_client, happy_day_example, casting_log)
-    result["hypothesis"] = hypothesis
 
-    print("Asking Skeptic for a cold review (claim + competing_explanation only)...")
-    skeptic_review = get_skeptic_review(anthropic_client, hypothesis["claim"], hypothesis["competing_explanation"])
+    hypothesis_attempts = []
+    skeptic_review = None
+    for attempt in range(1, MAX_HYPOTHESIS_ATTEMPTS + 1):
+        print(f"Asking Skeptic for a cold review (attempt {attempt}, claim + competing_explanation only)...")
+        skeptic_review = get_skeptic_review(anthropic_client, hypothesis["claim"], hypothesis["competing_explanation"])
+        print(f"  skeptic verdict: {skeptic_review['skeptic_verdict']}, competing_explanation assessed as: {skeptic_review['competing_explanation_assessment']}")
+        hypothesis_attempts.append({"hypothesis": hypothesis, "skeptic_review": skeptic_review})
+
+        if skeptic_review["skeptic_verdict"] == "holds_up" or attempt == MAX_HYPOTHESIS_ATTEMPTS:
+            break
+
+        print("  Skeptic found the hypothesis weak - asking the Driver to revise before spending test budget...")
+        hypothesis = revise_hypothesis(anthropic_client, happy_day_example, casting_log, hypothesis, skeptic_review)
+
+    result["hypothesis"] = hypothesis
     result["skeptic_review"] = skeptic_review
-    print(f"  skeptic verdict: {skeptic_review['skeptic_verdict']}, competing_explanation assessed as: {skeptic_review['competing_explanation_assessment']}")
+    result["hypothesis_attempts"] = hypothesis_attempts
 
     print("Executing confirm_test against the live SUT...")
     confirm_result = execute_test(hypothesis["confirm_test"], next(test_counter))
