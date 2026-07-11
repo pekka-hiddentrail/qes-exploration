@@ -146,14 +146,23 @@ def _render_calls_table(calls) -> str:
     """
 
 
-def _render_test_entry(entry) -> str:
+def _render_test_entry(entry, context_label=None) -> str:
+    """context_label overrides the hypothesis line for tests that never carry a
+    linked_hypothesis field at all - confirm/disconfirm/follow-up tests come straight
+    from execute_test(), which has no such field (only casting_log entries get one,
+    added by the caller in run_checkpoint_cycle). Without this, those tests rendered
+    as "no linked hypothesis" even though they're the most hypothesis-driven tests
+    in the whole run."""
     if not entry:
         return ""
     request = entry.get("request", {})
-    linked = entry.get("linked_hypothesis")
-    linked_html = f"<strong>Hypothesis:</strong> {_esc(linked)}" if linked else (
-        '<span class="probe-label">Edge-case probe</span> (no linked hypothesis)'
-    )
+    if context_label:
+        linked_html = f"<strong>{_esc(context_label)}</strong>"
+    else:
+        linked = entry.get("linked_hypothesis")
+        linked_html = f"<strong>Hypothesis:</strong> {_esc(linked)}" if linked else (
+            '<span class="probe-label">Edge-case probe</span> (no linked hypothesis)'
+        )
     test_number = entry.get("test_number")
     number_html = f'<span class="test-number">Test #{_esc(test_number)}</span>' if test_number is not None else ""
 
@@ -193,9 +202,16 @@ def _render_casting_section(casting_log, behavior_checkpoints) -> str:
 
     behavior_by_checkpoint = {bc["checkpoint"]: bc for bc in behavior_checkpoints}
 
+    # A checkpoint that gave up on its very first round proposes zero tests, so it
+    # never contributes anything to casting_log - but it still gets a behavior
+    # hypothesis + Skeptic review. Iterating only over by_checkpoint's keys would
+    # silently drop that checkpoint's conclusion entirely, even though it's real,
+    # generated data sitting in behavior_checkpoints.
+    all_checkpoint_nums = sorted(set(by_checkpoint) | set(behavior_by_checkpoint))
+
     parts = []
-    for checkpoint_num in sorted(by_checkpoint):
-        rounds = by_checkpoint[checkpoint_num]
+    for checkpoint_num in all_checkpoint_nums:
+        rounds = by_checkpoint.get(checkpoint_num, {})
         round_html = []
         for round_num in sorted(rounds):
             entries = rounds[round_num]
@@ -211,6 +227,8 @@ def _render_casting_section(casting_log, behavior_checkpoints) -> str:
               <div class="test-grid">{tests_html}</div>
             </div>
             """)
+        if not rounds:
+            round_html.append('<p class="prose-muted">No rounds executed - the Driver gave up immediately at the start of this checkpoint.</p>')
 
         behavior_html = ""
         bc = behavior_by_checkpoint.get(checkpoint_num)
@@ -248,7 +266,7 @@ def _render_followup_rounds(followup_rounds) -> str:
     for i, round_entry in enumerate(followup_rounds, start=1):
         test_html = ""
         if "test_result" in round_entry:
-            test_html = _render_test_entry(round_entry["test_result"])
+            test_html = _render_test_entry(round_entry["test_result"], context_label=f"Follow-up test (round {i})")
         parts.append(f"""
         <div class="followup-round">
           <p class="eyebrow">Follow-up round {i}
@@ -301,9 +319,9 @@ def _render_investigation_section(output) -> str:
       <div class="checkpoint">
         <h3>Confirm / disconfirm</h3>
         <p class="eyebrow">Confirm test</p>
-        {_render_test_entry(output.get('confirm_result', {}))}
+        {_render_test_entry(output.get('confirm_result', {}), context_label="Testing the claim above")}
         <p class="eyebrow">Disconfirm test</p>
-        {_render_test_entry(output.get('disconfirm_result', {}))}
+        {_render_test_entry(output.get('disconfirm_result', {}), context_label="Testing the claim above")}
       </div>
 
       <div class="checkpoint">
@@ -512,9 +530,13 @@ def _stat(value, label) -> str:
 def render_report(output: dict, bug_report: dict | None) -> str:
     calls = output.get("calls", [])
     casting_log = output.get("casting_log", [])
+    behavior_checkpoints = output.get("behavior_checkpoints", [])
     executed = [e for e in casting_log if not e.get("skipped")]
     skipped = [e for e in casting_log if e.get("skipped")]
-    checkpoints_run = len({e["checkpoint"] for e in casting_log}) if casting_log else 0
+    # A checkpoint that gave up on its first round contributes nothing to
+    # casting_log but still produces a behavior_checkpoints entry - count both
+    # sources so this can't undercount relative to what actually ran.
+    checkpoints_run = len({e["checkpoint"] for e in casting_log} | {bc["checkpoint"] for bc in behavior_checkpoints})
 
     if output.get("error"):
         eyebrow, title = "Run incomplete", "Stopped early"
@@ -578,7 +600,7 @@ def render_report(output: dict, bug_report: dict | None) -> str:
   <section id="casting">
     <p class="eyebrow">Phase 2</p>
     <h2>Casting &mdash; blind discovery</h2>
-    {_render_casting_section(casting_log, output.get('behavior_checkpoints', []))}
+    {_render_casting_section(casting_log, behavior_checkpoints)}
   </section>
 
   {_render_investigation_section(output)}
