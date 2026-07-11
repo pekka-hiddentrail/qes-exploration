@@ -1,23 +1,31 @@
 """
-Live version of pattern-detection-poc: instead of a hand-typed mocked sequence, this
-actually calls a running sut.py (start it first with `uvicorn sut:app --port 8000`),
-gets real latencies for 8 baseline calls plus one pathological call, asks Claude to
-notice the pattern and hypothesize as before - but now confirm_test/disconfirm_test
-are directly-executable request bodies instead of prose, and the harness actually
-POSTs them to the live server and checks whether the real outcome matches Claude's
-predicted_latency_class.
+Live version of pattern-detection-poc, with a blind casting phase in front of it:
+instead of handing the investigator a call log that already contains the anomaly, it
+only sees 8 normal baseline calls (start sut.py with `uvicorn sut:app --port 8000`
+first) and has to propose its own batch of candidate hypotheses (each with test
+ideas) plus pure edge-case probes against the live SUT, with no hint that any bug
+exists or what it might look like. The real vulnerability stays exactly as-is in
+sut.py, undisclosed. Only if a batch reveals something anomalous does the flow
+continue into hypothesis formation, a separate cold Skeptic review, real
+confirm/disconfirm test execution, and a bounded follow-up loop that also tries to
+operationalize Skeptic's own disproof strategies.
 """
 
 import itertools
 import json
 import os
 import re
+import sys
 import time
 from pathlib import Path
 
 import httpx
 from anthropic import Anthropic
 from dotenv import load_dotenv
+
+# Model-generated text (reasoning, probes) can contain non-ASCII characters (e.g. "~=")
+# that the default Windows console codec can't encode, crashing a plain print().
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 MODEL = "claude-sonnet-4-6"
 MAX_ATTEMPTS = 3
@@ -27,9 +35,11 @@ SUT_READY_TIMEOUT = 5.0
 
 # sut.py's regex (^(a+)+$) only backtracks catastrophically on runs of the letter 'a'
 # specifically - a long run of any OTHER character fails the match almost instantly
-# (no backtracking) and is completely safe. The calibrated pathological input has a
-# run of 25 'a's; a proposed test with a longer 'a'-run than this is untested and
-# could hang the SUT for a very long time, so it's refused rather than executed.
+# (no backtracking) and is completely safe. The known-safe threshold below applies to
+# ANY test text this harness executes, whether proposed during casting,
+# confirm/disconfirm, or follow-up - a proposed test with a longer 'a'-run than this
+# is untested and could hang the SUT for a very long time, so it's refused rather
+# than executed.
 DANGEROUS_CHAR = "a"
 MAX_SAFE_REPEAT_RUN = 25
 
@@ -41,6 +51,9 @@ MAX_SAFE_REPEAT_RUN = 25
 SLOW_THRESHOLD_MS = 500
 SLOW_MULTIPLIER = 5
 
+MAX_CASTING_ROUNDS = 3
+MAX_FOLLOWUP_ROUNDS = 2
+
 BASELINE_TEXTS = [
     "Hello there, testing.",
     "A short one.",
@@ -51,10 +64,6 @@ BASELINE_TEXTS = [
     "This one is quite a bit longer than most of the previous test messages we've sent so far.",
     "Medium length input for the ninth or so call in this sequence.",
 ]
-
-# Calibrated empirically (see sut.py docstring): 25 'a's + '!' takes ~3.6s on this
-# machine via catastrophic regex backtracking, despite unremarkable length (26 chars).
-PATHOLOGICAL_TEXT = "a" * 25 + "!"
 
 # Matches a run of 3+ identical characters, optionally followed by one different
 # character (the pathological pattern's structure: a repeated run + a terminator
@@ -97,14 +106,329 @@ def redact_calls_for_model(calls: list[dict]) -> list[dict]:
 
 def redact_history_for_model(history: list[dict]) -> list[dict]:
     """Same idea as redact_calls_for_model, for the round-by-round history shown to
-    get_followup: redact the literal executed text and any free-text fields that
-    might quote it, without touching the original (kept intact for output.json)."""
+    get_followup/get_casting_round: redact the literal executed text and any
+    free-text fields that might quote it, without touching the original (kept intact
+    for output.json)."""
     redacted = json.loads(json.dumps(history))
     for entry in redacted:
-        for key in ("sent_text", "predicted_outcome", "skip_reason"):
+        for key in ("sent_text", "predicted_outcome", "skip_reason", "round_reasoning", "linked_hypothesis"):
             if key in entry:
                 entry[key] = redact_pathological_content(entry[key])
     return redacted
+
+
+def call_tool_with_retry(client, *, model, system, tools, tool_name, user_message, validate_fn, max_tokens):
+    """Shared call->validate->retry loop used by every tool-forced Claude call in this file."""
+    last_errors = ["no attempts made"]
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        message = client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            system=system,
+            tools=tools,
+            tool_choice={"type": "tool", "name": tool_name},
+            messages=[{"role": "user", "content": user_message}],
+        )
+
+        tool_use = next((block for block in message.content if block.type == "tool_use"), None)
+        if tool_use is None:
+            last_errors = [f"no tool_use block in response (stop_reason={message.stop_reason})"]
+            print(f"  attempt {attempt} produced no tool call: {last_errors} - retrying")
+            continue
+
+        errors = validate_fn(tool_use.input)
+        if not errors:
+            return tool_use.input
+
+        last_errors = errors
+        print(f"  attempt {attempt} produced malformed output: {errors} - retrying")
+
+    raise RuntimeError(f"Gave up after {MAX_ATTEMPTS} attempts, last errors: {last_errors}")
+
+
+def call_sut(client: httpx.Client, text: str) -> dict:
+    start = time.perf_counter()
+    response = client.post(SUT_URL, json={"text": text}, timeout=60.0)
+    measured_latency_ms = (time.perf_counter() - start) * 1000
+    return {
+        "status": response.status_code,
+        "body": response.json(),
+        "measured_latency_ms": round(measured_latency_ms, 1),
+    }
+
+
+def build_call_log(client: httpx.Client) -> list[dict]:
+    """Only the 8 normal baseline calls - no pre-baked anomaly. Whatever the Driver
+    ends up finding (if anything) has to come from its own casting."""
+    calls = []
+    for i, text in enumerate(BASELINE_TEXTS, start=1):
+        print(f"  calling baseline {i}...")
+        result = call_sut(client, text)
+        calls.append(
+            {
+                "index": i,
+                "request": {"method": "POST", "path": "/analyze", "body": {"text": text}},
+                "response": result,
+            }
+        )
+    return calls
+
+
+def baseline_rate_ms_per_char(calls: list[dict]) -> float:
+    """Empirical worst-case ms/char from the real baseline calls."""
+    rates = [
+        c["response"]["measured_latency_ms"] / max(len(c["request"]["body"]["text"]), 1)
+        for c in calls
+    ]
+    return max(rates)
+
+
+def longest_run_of(text: str, char: str) -> int:
+    return max((len(list(group)) for key, group in itertools.groupby(text) if key == char), default=0)
+
+
+def classify_latency(measured_ms: float, text_length: int, baseline_rate: float) -> str:
+    expected_ms = baseline_rate * text_length
+    threshold = max(SLOW_THRESHOLD_MS, expected_ms * SLOW_MULTIPLIER)
+    return "slow" if measured_ms > threshold else "fast"
+
+
+def execute_test(client: httpx.Client, test: dict, baseline_rate: float) -> dict:
+    text = test["text"]
+    run_length = longest_run_of(text, DANGEROUS_CHAR)
+    if run_length > MAX_SAFE_REPEAT_RUN:
+        print(
+            f"  refusing to execute: longest run of '{DANGEROUS_CHAR}' is {run_length}, "
+            f"exceeds safe ceiling of {MAX_SAFE_REPEAT_RUN}"
+        )
+        return {
+            "sent_text": text,
+            "predicted_outcome": test["predicted_outcome"],
+            "predicted_latency_class": test["predicted_latency_class"],
+            "skipped": True,
+            "skip_reason": (
+                f"longest run of '{DANGEROUS_CHAR}' is {run_length} chars, exceeding the "
+                f"calibrated safe ceiling of {MAX_SAFE_REPEAT_RUN} - refused to avoid "
+                "hanging the SUT for an unknown, potentially very long time."
+            ),
+        }
+
+    # Re-warm the connection before timing: an idle gap (e.g. the Claude API call, or a
+    # skipped confirm_test never firing a request) makes the next request on this same
+    # client pay a ~2s reconnection cost that has nothing to do with the SUT's own
+    # latency - discovered when a disconfirm_test with no repeated characters at all
+    # measured 2s despite the SUT reporting 38ms of actual work.
+    client.get(SUT_DOCS_URL, timeout=SUT_READY_TIMEOUT)
+
+    result = call_sut(client, text)
+    actual_latency_class = classify_latency(result["measured_latency_ms"], len(text), baseline_rate)
+    return {
+        "sent_text": text,
+        "predicted_outcome": test["predicted_outcome"],
+        "predicted_latency_class": test["predicted_latency_class"],
+        "actual_measured_latency_ms": result["measured_latency_ms"],
+        "actual_latency_class": actual_latency_class,
+        "prediction_matched": actual_latency_class == test["predicted_latency_class"],
+    }
+
+
+def unwrap_accidental_json_body(text: str) -> str:
+    """Defends against the model wrapping its probe in the request envelope itself
+    (e.g. '{"text": "..."}') instead of providing raw text content - seen in practice
+    despite an explicit instruction not to, so the prompt fix alone isn't trusted."""
+    stripped = text.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            return text
+        if isinstance(parsed, dict) and isinstance(parsed.get("text"), str):
+            return parsed["text"]
+    return text
+
+
+CASTING_TOOL = {
+    "name": "submit_casting_round",
+    "description": (
+        "Propose a batch of tests: some testing specific candidate hypotheses about "
+        "possible bugs, and some pure edge-case probes not tied to any theory - or "
+        "report that you have nothing more worth trying."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "give_up": {
+                "type": "boolean",
+                "description": "True if you believe you've explored reasonably and have nothing more worth proposing.",
+            },
+            "reasoning": {
+                "type": "string",
+                "description": "Overall reasoning for this round's set of tests (or for giving up).",
+            },
+            "candidate_tests": {
+                "type": "array",
+                "description": (
+                    "Up to 6 tests total. Each is EITHER tied to a specific candidate hypothesis "
+                    "(set linked_hypothesis to that theory, stated in full) OR a pure "
+                    "edge-case/negative-case probe not tied to any theory (set linked_hypothesis "
+                    "to an empty string). Mix both kinds in the same list."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "linked_hypothesis": {
+                            "type": "string",
+                            "description": "The specific candidate theory this test checks, stated in full. Empty string \"\" if this is a pure edge-case probe.",
+                        },
+                        "text": {"type": "string", "description": "The literal text to send as the request body."},
+                        "predicted_outcome": {"type": "string", "description": "Free-text prediction of what will happen."},
+                        "predicted_latency_class": {"type": "string", "enum": ["fast", "slow"]},
+                    },
+                    "required": ["linked_hypothesis", "text", "predicted_outcome", "predicted_latency_class"],
+                },
+            },
+        },
+        "required": ["give_up", "reasoning", "candidate_tests"],
+    },
+}
+
+CASTING_SYSTEM_PROMPT = """You are testing a live API endpoint (POST /analyze, a text-scoring
+service) to look for bugs or unexpected behavior. You've been shown baseline calls establishing
+normal behavior - latency scales predictably with input length. Nothing is currently flagged as
+anomalous, and you do not know whether any bug exists at all.
+
+In one round, propose a BATCH of tests - up to 6 total:
+1. Candidate hypotheses: think of a few (up to 3) specific, falsifiable theories about possible
+   bugs (e.g. related to input length, character content, encoding, whitespace, or anything else a
+   careful tester would suspect). For each, propose 1-2 concrete test ideas designed to check it -
+   a literal request body and a prediction of what would happen if that specific theory were true.
+   Set linked_hypothesis to the full theory text for these.
+2. Pure edge-case probes: also propose some tests (up to 3) not tied to any specific theory - just
+   general negative-case/boundary testing instinct (empty input, unusual characters, whitespace,
+   very long input, etc). For these, predict "fast" (the null hypothesis: expect normal behavior)
+   and set linked_hypothesis to an empty string.
+
+All of these tests will be executed for real, together, before you see any results - they don't
+depend on each other's outcomes, so make each one a genuinely independent check rather than a
+refinement of another test in the same batch. You'll see every real result before being asked for
+another round, and can refine across rounds then.
+
+If an earlier round's test was refused rather than executed (check for a skip_reason in
+tests_tried_in_earlier_rounds) and you still think that specific hypothesis is worth pursuing, try a
+substantially reduced/shorter version of the same idea in this round before moving on to a different
+hypothesis. A refusal doesn't mean the theory is wrong - it means that specific attempt was too
+extreme to safely run. Don't abandon a promising theory just because one attempt at it got refused.
+
+If you believe you've explored reasonably and have no more good ideas worth proposing, set give_up
+to true rather than proposing something arbitrary just to have something to submit.
+
+Call submit_casting_round with your answer."""
+
+
+def validate_casting_response(data) -> list[str]:
+    errors = []
+    if not isinstance(data, dict):
+        return [f"expected an object, got {type(data).__name__}"]
+
+    for key in ("give_up", "reasoning", "candidate_tests"):
+        if key not in data:
+            errors.append(f"missing required field '{key}'")
+
+    if not isinstance(data.get("give_up"), bool):
+        errors.append("'give_up' must be a boolean")
+
+    tests = data.get("candidate_tests")
+    if not isinstance(tests, list):
+        errors.append("'candidate_tests' must be a list")
+        return errors
+
+    if not data.get("give_up") and len(tests) == 0:
+        errors.append("'candidate_tests' must be non-empty when give_up is false")
+
+    for i, test in enumerate(tests):
+        if not isinstance(test, dict):
+            errors.append(f"candidate_tests[{i}] must be an object")
+            continue
+        if not isinstance(test.get("linked_hypothesis"), str):
+            errors.append(f"candidate_tests[{i}].linked_hypothesis must be a string")
+        if not isinstance(test.get("text"), str):
+            errors.append(f"candidate_tests[{i}].text must be a string")
+        if test.get("predicted_latency_class") not in ("fast", "slow"):
+            errors.append(f"candidate_tests[{i}].predicted_latency_class must be 'fast' or 'slow'")
+        if "predicted_outcome" not in test:
+            errors.append(f"candidate_tests[{i}] missing required field 'predicted_outcome'")
+
+    return errors
+
+
+def get_casting_round(client: Anthropic, calls: list[dict], casting_log: list[dict]) -> dict:
+    evidence = {
+        "scenario": f"{len(calls)} established baseline calls to POST /analyze, a text-scoring endpoint. Same endpoint, same session.",
+        "baseline_calls": redact_calls_for_model(calls),
+        "tests_tried_in_earlier_rounds": redact_history_for_model(casting_log),
+    }
+    return call_tool_with_retry(
+        client,
+        model=MODEL,
+        system=CASTING_SYSTEM_PROMPT,
+        tools=[CASTING_TOOL],
+        tool_name="submit_casting_round",
+        user_message=json.dumps(evidence, indent=2),
+        validate_fn=validate_casting_response,
+        max_tokens=3072,
+    )
+
+
+def run_casting(anthropic_client: Anthropic, http_client: httpx.Client, calls: list[dict], rate: float):
+    """Casting phase: propose a batch of hypothesis-tied tests + pure edge-case probes
+    each round (no known anomaly at the start), execute the whole batch for real
+    (each test is independent, so batching loses nothing here - unlike the follow-up
+    loop, where sequencing matters), stop on the first result that comes back slower
+    than the empirical baseline predicts, on the model giving up, or on hitting the
+    round cap.
+
+    Returns (casting_log, anomaly_entry, gave_up). anomaly_entry is None if nothing
+    anomalous was found. casting_log is a flat list of every executed test result,
+    across all rounds.
+    """
+    casting_log = []
+    for round_num in range(1, MAX_CASTING_ROUNDS + 1):
+        print(f"Asking Claude for a casting round (round {round_num})...")
+        casting = get_casting_round(anthropic_client, calls, casting_log)
+        if casting["give_up"]:
+            print(f"  Claude gave up casting: {casting['reasoning']}")
+            return casting_log, None, True
+
+        print(f"  round reasoning: {casting['reasoning']}")
+        anomaly_entry = None
+        for test in casting["candidate_tests"]:
+            text = unwrap_accidental_json_body(test["text"])
+            linked = test["linked_hypothesis"]
+            label = f"hypothesis: {linked}" if linked else "edge case"
+            print(f"  test ({label}): {text!r}")
+
+            synthetic_test = {
+                "text": text,
+                "predicted_outcome": test["predicted_outcome"],
+                "predicted_latency_class": test["predicted_latency_class"],
+            }
+            result = execute_test(http_client, synthetic_test, rate)
+            entry = {"round": round_num, "round_reasoning": casting["reasoning"], "linked_hypothesis": linked, **result}
+            casting_log.append(entry)
+
+            if result.get("skipped"):
+                print("    refused as unsafe - no signal, continuing")
+                continue
+
+            print(f"    measured {result['actual_measured_latency_ms']}ms - {result['actual_latency_class']}")
+            if result["actual_latency_class"] == "slow" and anomaly_entry is None:
+                print(f"    anomaly found ({label})")
+                anomaly_entry = entry
+
+        if anomaly_entry is not None:
+            return casting_log, anomaly_entry, False
+
+    return casting_log, None, False
 
 
 PATTERN_TOOL = {
@@ -199,70 +523,6 @@ Produce:
 Call submit_pattern_hypothesis with your answer."""
 
 
-def call_tool_with_retry(client, *, model, system, tools, tool_name, user_message, validate_fn, max_tokens):
-    """Shared call->validate->retry loop used by every tool-forced Claude call in this file."""
-    last_errors = ["no attempts made"]
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        message = client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            system=system,
-            tools=tools,
-            tool_choice={"type": "tool", "name": tool_name},
-            messages=[{"role": "user", "content": user_message}],
-        )
-
-        tool_use = next((block for block in message.content if block.type == "tool_use"), None)
-        if tool_use is None:
-            last_errors = [f"no tool_use block in response (stop_reason={message.stop_reason})"]
-            print(f"  attempt {attempt} produced no tool call: {last_errors} - retrying")
-            continue
-
-        errors = validate_fn(tool_use.input)
-        if not errors:
-            return tool_use.input
-
-        last_errors = errors
-        print(f"  attempt {attempt} produced malformed output: {errors} - retrying")
-
-    raise RuntimeError(f"Gave up after {MAX_ATTEMPTS} attempts, last errors: {last_errors}")
-
-
-def call_sut(client: httpx.Client, text: str) -> dict:
-    start = time.perf_counter()
-    response = client.post(SUT_URL, json={"text": text}, timeout=60.0)
-    measured_latency_ms = (time.perf_counter() - start) * 1000
-    return {
-        "status": response.status_code,
-        "body": response.json(),
-        "measured_latency_ms": round(measured_latency_ms, 1),
-    }
-
-
-def build_call_log(client: httpx.Client) -> list[dict]:
-    calls = []
-    for i, text in enumerate(BASELINE_TEXTS + [PATHOLOGICAL_TEXT], start=1):
-        print(f"  calling baseline/probe {i}...")
-        result = call_sut(client, text)
-        calls.append(
-            {
-                "index": i,
-                "request": {"method": "POST", "path": "/analyze", "body": {"text": text}},
-                "response": result,
-            }
-        )
-    return calls
-
-
-def baseline_rate_ms_per_char(calls: list[dict]) -> float:
-    """Empirical worst-case ms/char from the real baseline calls (excludes the pathological one)."""
-    rates = [
-        c["response"]["measured_latency_ms"] / max(len(c["request"]["body"]["text"]), 1)
-        for c in calls[: len(BASELINE_TEXTS)]
-    ]
-    return max(rates)
-
-
 def validate_pattern_hypothesis(data) -> list[str]:
     errors = []
     if not isinstance(data, dict):
@@ -305,7 +565,7 @@ def validate_pattern_hypothesis(data) -> list[str]:
 
 def get_hypothesis(client: Anthropic, calls: list[dict]) -> dict:
     evidence = {
-        "scenario": "9 sequential calls to POST /analyze, a text-scoring endpoint. Same endpoint, same session, no other traffic in between.",
+        "scenario": f"{len(calls)} sequential calls to POST /analyze, a text-scoring endpoint. Same endpoint, same session, no other traffic in between.",
         "calls": redact_calls_for_model(calls),
     }
     return call_tool_with_retry(
@@ -318,63 +578,6 @@ def get_hypothesis(client: Anthropic, calls: list[dict]) -> dict:
         validate_fn=validate_pattern_hypothesis,
         max_tokens=2048,
     )
-
-
-def longest_run_of(text: str, char: str) -> int:
-    return max((len(list(group)) for key, group in itertools.groupby(text) if key == char), default=0)
-
-
-assert longest_run_of(PATHOLOGICAL_TEXT, DANGEROUS_CHAR) <= MAX_SAFE_REPEAT_RUN, (
-    "PATHOLOGICAL_TEXT exceeds the safety ceiling that execute_test() enforces for "
-    "proposed tests, but build_call_log() sends it with no runtime guard - if this "
-    "constant is ever recalibrated longer, fix this assertion only after confirming "
-    "the new value's timing is still bounded (see sut.py)."
-)
-
-
-def classify_latency(measured_ms: float, text_length: int, baseline_rate: float) -> str:
-    expected_ms = baseline_rate * text_length
-    threshold = max(SLOW_THRESHOLD_MS, expected_ms * SLOW_MULTIPLIER)
-    return "slow" if measured_ms > threshold else "fast"
-
-
-def execute_test(client: httpx.Client, test: dict, baseline_rate: float) -> dict:
-    text = test["text"]
-    run_length = longest_run_of(text, DANGEROUS_CHAR)
-    if run_length > MAX_SAFE_REPEAT_RUN:
-        print(
-            f"  refusing to execute: longest run of '{DANGEROUS_CHAR}' is {run_length}, "
-            f"exceeds safe ceiling of {MAX_SAFE_REPEAT_RUN}"
-        )
-        return {
-            "sent_text": text,
-            "predicted_outcome": test["predicted_outcome"],
-            "predicted_latency_class": test["predicted_latency_class"],
-            "skipped": True,
-            "skip_reason": (
-                f"longest run of '{DANGEROUS_CHAR}' is {run_length} chars, exceeding the "
-                f"calibrated safe ceiling of {MAX_SAFE_REPEAT_RUN} - refused to avoid "
-                "hanging the SUT for an unknown, potentially very long time."
-            ),
-        }
-
-    # Re-warm the connection before timing: an idle gap (e.g. the Claude API call, or a
-    # skipped confirm_test never firing a request) makes the next request on this same
-    # client pay a ~2s reconnection cost that has nothing to do with the SUT's own
-    # latency - discovered when a disconfirm_test with no repeated characters at all
-    # measured 2s despite the SUT reporting 38ms of actual work.
-    client.get(SUT_DOCS_URL, timeout=SUT_READY_TIMEOUT)
-
-    result = call_sut(client, text)
-    actual_latency_class = classify_latency(result["measured_latency_ms"], len(text), baseline_rate)
-    return {
-        "sent_text": text,
-        "predicted_outcome": test["predicted_outcome"],
-        "predicted_latency_class": test["predicted_latency_class"],
-        "actual_measured_latency_ms": result["measured_latency_ms"],
-        "actual_latency_class": actual_latency_class,
-        "prediction_matched": actual_latency_class == test["predicted_latency_class"],
-    }
 
 
 SKEPTIC_TOOL = {
@@ -435,6 +638,8 @@ Also propose at least 2 concrete, distinct ways someone could actually test to p
 WRONG - real falsification strategies (e.g. a specific comparison, a specific probe, a specific
 boundary to check), not a restatement of your doubts. Think about what a genuinely surprising
 result would look like if the claim were false, not just what would make you personally uneasy.
+You are proposing strategies, not writing an executable test yourself - a separate step will try to
+turn whichever of your ideas is actually testable into a real request.
 
 Call submit_skeptic_review with your answer."""
 
@@ -478,8 +683,6 @@ def get_skeptic_review(client: Anthropic, claim: str, competing_explanation: str
     )
 
 
-MAX_FOLLOWUP_ROUNDS = 2
-
 FOLLOWUP_TOOL = {
     "name": "submit_followup",
     "description": (
@@ -514,7 +717,9 @@ FOLLOWUP_TOOL = {
 FOLLOWUP_SYSTEM_PROMPT = f"""You are continuing an investigation into an anomaly in a system under test.
 You already formed a hypothesis and a competing explanation, and proposed a confirm test and a
 disconfirm test. You'll now see what actually happened when those tests were run for real -
-including cases where a test was refused rather than executed.
+including cases where a test was refused rather than executed. You'll also see an independent cold
+critique of your original claim (Skeptic), including specific strategies Skeptic proposed for
+disproving it.
 
 IMPORTANT constraint: this SUT will refuse to execute any test whose text contains a run of one
 repeated character longer than {MAX_SAFE_REPEAT_RUN} characters, regardless of which character, to
@@ -525,9 +730,13 @@ Decide:
 1. Is the hypothesis corroborated (survived a real disconfirmation attempt), refuted (contradicted
    by what actually happened), or inconclusive (a test was refused, or didn't actually discriminate)?
 2. If not corroborated, is there a next test worth actually running? If so, propose one - a literal
-   request body, not a description - designed to make progress given what you now know (e.g. if a
-   test was refused for being too long, don't just resubmit a shorter version of the same idea if a
-   different angle would be more informative).
+   request body, not a description - designed to make progress given what you now know. Try to
+   operationalize one of Skeptic's disproof strategies as a real, executable test (a literal request
+   body whose outcome you can observe as fast/slow) if any of them can be expressed that way. If
+   none of Skeptic's strategies are testable through this endpoint (e.g. they require server-side
+   profiling or code changes you don't have access to), say so explicitly and design the best test
+   you can from the test history instead - don't just resubmit a shorter version of a prior idea if
+   a different angle, especially one Skeptic raised, would be more informative.
 
 Call submit_followup with your answer."""
 
@@ -562,10 +771,12 @@ def validate_followup(data) -> list[str]:
     return errors
 
 
-def get_followup(client: Anthropic, hypothesis: dict, history: list[dict]) -> dict:
+def get_followup(client: Anthropic, hypothesis: dict, skeptic_review: dict, history: list[dict]) -> dict:
     evidence = {
         "claim": redact_pathological_content(hypothesis["claim"]),
         "competing_explanation": redact_pathological_content(hypothesis["competing_explanation"]),
+        "skeptic_disproof_strategies": [redact_pathological_content(s) for s in skeptic_review["disproof_strategies"]],
+        "skeptic_reasoning": redact_pathological_content(skeptic_review["reasoning"]),
         "rounds_so_far": redact_history_for_model(history),
     }
     return call_tool_with_retry(
@@ -576,6 +787,177 @@ def get_followup(client: Anthropic, hypothesis: dict, history: list[dict]) -> di
         tool_name="submit_followup",
         user_message=json.dumps(evidence, indent=2),
         validate_fn=validate_followup,
+        max_tokens=1536,
+    )
+
+
+def run_investigation(anthropic_client: Anthropic, http_client: httpx.Client, calls: list[dict], rate: float) -> dict:
+    """Everything that happens once an anomaly has been found: hypothesis formation,
+    a cold Skeptic review, real confirm/disconfirm execution, and a bounded
+    follow-up loop informed by real outcomes and by Skeptic's disproof strategies."""
+    result = {}
+
+    print("Asking Claude for a hypothesis...")
+    hypothesis = get_hypothesis(anthropic_client, calls)
+    result["hypothesis"] = hypothesis
+
+    print("Asking Skeptic for a cold review (claim + competing_explanation only)...")
+    skeptic_review = get_skeptic_review(anthropic_client, hypothesis["claim"], hypothesis["competing_explanation"])
+    result["skeptic_review"] = skeptic_review
+    print(f"  skeptic verdict: {skeptic_review['skeptic_verdict']}, competing_explanation assessed as: {skeptic_review['competing_explanation_assessment']}")
+
+    print("Executing confirm_test against the live SUT...")
+    confirm_result = execute_test(http_client, hypothesis["confirm_test"], rate)
+    result["confirm_result"] = confirm_result
+
+    print("Executing disconfirm_test against the live SUT...")
+    disconfirm_result = execute_test(http_client, hypothesis["disconfirm_test"], rate)
+    result["disconfirm_result"] = disconfirm_result
+
+    history = [
+        {"round": "confirm_test", **confirm_result},
+        {"round": "disconfirm_test", **disconfirm_result},
+    ]
+    followup_rounds = []
+    stopped_reason = "round_cap_reached"
+    for round_num in range(1, MAX_FOLLOWUP_ROUNDS + 1):
+        print(f"Asking Claude for a verdict + follow-up (round {round_num})...")
+        followup = get_followup(anthropic_client, hypothesis, skeptic_review, history)
+        print(f"  verdict: {followup['verdict']} - continue: {followup['continue_investigation']}")
+
+        round_entry = {
+            "verdict": followup["verdict"],
+            "reasoning": followup["reasoning"],
+            "continue_investigation": followup["continue_investigation"],
+        }
+        if not followup["continue_investigation"]:
+            followup_rounds.append(round_entry)
+            stopped_reason = "satisfied"
+            break
+
+        print(f"  executing follow-up test (round {round_num})...")
+        test_result = execute_test(http_client, followup["next_test"], rate)
+        round_entry["test_result"] = test_result
+        followup_rounds.append(round_entry)
+        history.append({"round": f"followup_{round_num}", **test_result})
+
+    result["followup_rounds"] = followup_rounds
+    # "round_cap_reached" here means the last executed follow-up test (if any) in
+    # followup_rounds never got a verdict rendered on it - the loop ran out of
+    # rounds while the model still wanted to continue investigating.
+    result["followup_stopped_reason"] = stopped_reason
+    return result
+
+
+BUG_REPORT_TOOL = {
+    "name": "submit_bug_report",
+    "description": "Write a bug report summarizing what was found, for a human engineer to read and act on.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "description": "A short, specific summary of the bug."},
+            "description": {"type": "string", "description": "What's actually wrong, in plain terms."},
+            "steps_to_reproduce": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Concrete, literal steps a human could follow to reproduce this - the actual request(s) to send.",
+            },
+            "expected_behavior": {"type": "string"},
+            "actual_behavior": {"type": "string"},
+            "severity": {"type": "string", "enum": ["high", "medium", "low"]},
+            "status": {
+                "type": "string",
+                "enum": ["corroborated", "refuted", "inconclusive"],
+                "description": "How well-supported this is by the actual test results. Never claim 'proven' - only corroborated/refuted/inconclusive.",
+            },
+            "caveats": {
+                "type": "string",
+                "description": "Any remaining doubts, unresolved Skeptic objections, or limitations of the evidence gathered.",
+            },
+        },
+        "required": [
+            "title",
+            "description",
+            "steps_to_reproduce",
+            "expected_behavior",
+            "actual_behavior",
+            "severity",
+            "status",
+            "caveats",
+        ],
+    },
+}
+
+BUG_REPORT_SYSTEM_PROMPT = """You are writing a bug report for a human engineer, based on a completed
+investigation into an anomaly in a system under test. Unlike earlier steps in this investigation, you
+have full access to the actual literal evidence here - the real request text involved and the real,
+measured outcomes - because this report needs to be concretely actionable, not abstracted.
+
+Write a clear, honest bug report:
+- title/description: what's actually wrong, in plain terms
+- steps_to_reproduce: the literal request(s) a human could send to reproduce this themselves
+- expected_behavior vs actual_behavior: what should have happened vs what did
+- severity: your honest assessment
+- status: corroborated, refuted, or inconclusive - reflecting how well this investigation's own
+  confirm/disconfirm/follow-up testing actually supports it. Never claim something is "proven."
+- caveats: any real doubts remaining - especially any Skeptic objection that was never actually
+  settled by a real test, or anything the investigation left unresolved
+
+Call submit_bug_report with your answer."""
+
+
+def validate_bug_report(data) -> list[str]:
+    errors = []
+    if not isinstance(data, dict):
+        return [f"expected an object, got {type(data).__name__}"]
+
+    required = [
+        "title",
+        "description",
+        "steps_to_reproduce",
+        "expected_behavior",
+        "actual_behavior",
+        "severity",
+        "status",
+        "caveats",
+    ]
+    for key in required:
+        if key not in data:
+            errors.append(f"missing required field '{key}'")
+
+    steps = data.get("steps_to_reproduce")
+    if not isinstance(steps, list) or not all(isinstance(s, str) for s in steps):
+        errors.append("'steps_to_reproduce' must be a list of strings")
+
+    if data.get("severity") not in ("high", "medium", "low"):
+        errors.append("'severity' must be one of high/medium/low")
+
+    if data.get("status") not in ("corroborated", "refuted", "inconclusive"):
+        errors.append("'status' must be one of corroborated/refuted/inconclusive")
+
+    return errors
+
+
+def get_bug_report(client: Anthropic, investigation: dict) -> dict:
+    # Deliberately NOT redacted: the whole point is a human-actionable artifact, and
+    # the "keep the model blind to the literal pattern" concern only applied to
+    # hypothesis formation, not to documenting an already-completed investigation.
+    evidence = {
+        "hypothesis": investigation["hypothesis"],
+        "skeptic_review": investigation["skeptic_review"],
+        "confirm_result": investigation["confirm_result"],
+        "disconfirm_result": investigation["disconfirm_result"],
+        "followup_rounds": investigation["followup_rounds"],
+        "followup_stopped_reason": investigation["followup_stopped_reason"],
+    }
+    return call_tool_with_retry(
+        client,
+        model=MODEL,
+        system=BUG_REPORT_SYSTEM_PROMPT,
+        tools=[BUG_REPORT_TOOL],
+        tool_name="submit_bug_report",
+        user_message=json.dumps(evidence, indent=2),
+        validate_fn=validate_bug_report,
         max_tokens=1536,
     )
 
@@ -602,61 +984,43 @@ def main():
         except httpx.TransportError:
             raise SystemExit("sut.py isn't running. Start it first: uvicorn sut:app --port 8000")
 
-        print("Building call log from live SUT...")
+        print("Building baseline call log from live SUT...")
         calls = build_call_log(http_client)
         rate = baseline_rate_ms_per_char(calls)
 
         output = {"calls": calls}
         try:
-            print("Asking Claude for a hypothesis...")
-            hypothesis = get_hypothesis(anthropic_client, calls)
-            output["hypothesis"] = hypothesis
+            casting_log, anomaly_entry, gave_up = run_casting(anthropic_client, http_client, calls, rate)
+            output["casting_log"] = casting_log
 
-            print("Asking Skeptic for a cold review (claim + competing_explanation only)...")
-            skeptic_review = get_skeptic_review(anthropic_client, hypothesis["claim"], hypothesis["competing_explanation"])
-            output["skeptic_review"] = skeptic_review
-            print(f"  skeptic verdict: {skeptic_review['skeptic_verdict']}, competing_explanation assessed as: {skeptic_review['competing_explanation_assessment']}")
+            if anomaly_entry is None:
+                output["anomaly_found"] = False
+                output["casting_stopped_reason"] = "gave_up" if gave_up else "round_cap_reached"
+            else:
+                output["anomaly_found"] = True
 
-            print("Executing confirm_test against the live SUT...")
-            confirm_result = execute_test(http_client, hypothesis["confirm_test"], rate)
-            output["confirm_result"] = confirm_result
+                # Build the log to hand to the investigator: the 8 baseline calls plus
+                # every actually-executed casting test, in order, so its own
+                # reasoning trail (including tests that came back normal) is visible.
+                executed_tests = [e for e in casting_log if not e.get("skipped")]
+                calls_with_discovery = list(calls)
+                for i, entry in enumerate(executed_tests, start=len(calls) + 1):
+                    calls_with_discovery.append(
+                        {
+                            "index": i,
+                            "request": {"method": "POST", "path": "/analyze", "body": {"text": entry["sent_text"]}},
+                            "response": {"measured_latency_ms": entry["actual_measured_latency_ms"]},
+                        }
+                    )
 
-            print("Executing disconfirm_test against the live SUT...")
-            disconfirm_result = execute_test(http_client, hypothesis["disconfirm_test"], rate)
-            output["disconfirm_result"] = disconfirm_result
+                output.update(run_investigation(anthropic_client, http_client, calls_with_discovery, rate))
 
-            history = [
-                {"round": "confirm_test", **confirm_result},
-                {"round": "disconfirm_test", **disconfirm_result},
-            ]
-            followup_rounds = []
-            stopped_reason = "round_cap_reached"
-            for round_num in range(1, MAX_FOLLOWUP_ROUNDS + 1):
-                print(f"Asking Claude for a verdict + follow-up (round {round_num})...")
-                followup = get_followup(anthropic_client, hypothesis, history)
-                print(f"  verdict: {followup['verdict']} - continue: {followup['continue_investigation']}")
-
-                round_entry = {
-                    "verdict": followup["verdict"],
-                    "reasoning": followup["reasoning"],
-                    "continue_investigation": followup["continue_investigation"],
-                }
-                if not followup["continue_investigation"]:
-                    followup_rounds.append(round_entry)
-                    stopped_reason = "satisfied"
-                    break
-
-                print(f"  executing follow-up test (round {round_num})...")
-                test_result = execute_test(http_client, followup["next_test"], rate)
-                round_entry["test_result"] = test_result
-                followup_rounds.append(round_entry)
-                history.append({"round": f"followup_{round_num}", **test_result})
-
-            output["followup_rounds"] = followup_rounds
-            # "round_cap_reached" here means the last executed follow-up test (if any)
-            # in followup_rounds never got a verdict rendered on it - the loop ran out
-            # of rounds while the model still wanted to continue investigating.
-            output["followup_stopped_reason"] = stopped_reason
+                print("Writing bug report...")
+                bug_report = get_bug_report(anthropic_client, output)
+                bugs_path = out_dir / "bugs.json"
+                out_dir.mkdir(exist_ok=True)
+                bugs_path.write_text(json.dumps(bug_report, indent=2))
+                print(f"Wrote bug report to {bugs_path}")
 
         except RuntimeError as e:
             print(f"Stopped early: {e}")
@@ -664,7 +1028,10 @@ def main():
 
     write_output(output)
     if "error" not in output:
-        print("Now score it by hand against rubric.md.")
+        if output.get("anomaly_found"):
+            print("Now score it by hand against rubric.md.")
+        else:
+            print("No anomaly found during casting.")
 
 
 if __name__ == "__main__":
