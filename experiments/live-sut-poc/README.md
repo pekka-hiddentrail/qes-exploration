@@ -77,7 +77,7 @@ cp .env.example .env   # fill in ANTHROPIC_API_KEY
 python run_live.py
 ```
 
-Writes two files under `results/` (gitignored):
+Writes three files under `results/` (gitignored):
 - `output.json` - the full run: baseline calls, every casting round's reasoning and
   executed tests (tagged by checkpoint/round), `behavior_checkpoints` (behavior
   hypothesis + Skeptic critique for any checkpoint that found nothing), and if an
@@ -86,5 +86,12 @@ Writes two files under `results/` (gitignored):
 - `bugs.json` - present only if an anomaly was found: the final bug report (title,
   description, repro steps, expected vs. actual behavior, severity, and caveats about
   anything left unresolved).
+- `report.html` - the same content as `output.json` (+ `bugs.json` if present),
+  rendered as a single self-contained, human-readable page instead of raw JSON:
+  baseline calls, every checkpoint's rounds with reasoning and executed tests, each
+  checkpoint's behavior hypothesis and Skeptic critique, and (if found) the
+  investigation and bug report. Generated automatically at the end of every run by
+  `report.py`; rerun `python report.py` standalone to regenerate it from an existing
+  `results/` directory without a fresh live run.
 
 Score by hand against `rubric.md`.

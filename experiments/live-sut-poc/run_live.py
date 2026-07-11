@@ -33,6 +33,8 @@ import httpx
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+from report import render_report
+
 # Model-generated text (reasoning, probes) can contain non-ASCII characters (e.g. "~=")
 # that the default Windows console codec can't encode, crashing a plain print().
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -1305,6 +1307,7 @@ def main():
         baseline_model = fit_baseline_latency_model(calls)
 
         output = {"calls": calls}
+        bug_report = None
         try:
             casting_log, anomaly_entry, gave_up, behavior_checkpoints = run_checkpoint_cycle(
                 anthropic_client, http_client, calls, baseline_model
@@ -1346,6 +1349,11 @@ def main():
             output["error"] = str(e)
 
     write_output(output)
+
+    report_path = out_dir / "report.html"
+    report_path.write_text(render_report(output, bug_report), encoding="utf-8")
+    print(f"Wrote report to {report_path}")
+
     if "error" not in output:
         if output.get("anomaly_found"):
             print("Now score it by hand against rubric.md.")
