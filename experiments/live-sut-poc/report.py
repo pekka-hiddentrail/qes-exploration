@@ -6,6 +6,7 @@ end of every run; also runnable standalone against an existing results/ director
 
 import html
 import json
+import re
 from pathlib import Path
 
 
@@ -13,6 +14,70 @@ def _esc(value) -> str:
     if value is None:
         return ""
     return html.escape(str(value))
+
+
+_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+_CODE_RE = re.compile(r"`(.+?)`")
+_HEADER_RE = re.compile(r"^(#{1,6})\s+(.*)")
+_BULLET_RE = re.compile(r"^[-*]\s+(.*)")
+
+
+def _inline_markdown(text: str) -> str:
+    escaped = _esc(text)
+    escaped = _BOLD_RE.sub(r"<strong>\1</strong>", escaped)
+    escaped = _CODE_RE.sub(r"<code>\1</code>", escaped)
+    return escaped
+
+
+def _render_prose(text) -> str:
+    """The Driver and Skeptic write markdown-flavored prose (headers, **bold**,
+    `code`, bullet lists) in every free-text field - rendering it through bare
+    HTML-escaping left it as one flat paragraph with literal '##' and '**'
+    characters. This is a small, deliberately narrow markdown->HTML pass covering
+    just what these fields actually contain, not a general markdown parser."""
+    if not text:
+        return ""
+    html_parts = []
+    list_buffer = []
+    paragraph_buffer = []
+
+    def flush_list():
+        if list_buffer:
+            html_parts.append("<ul>" + "".join(f"<li>{item}</li>" for item in list_buffer) + "</ul>")
+            list_buffer.clear()
+
+    def flush_paragraph():
+        if paragraph_buffer:
+            html_parts.append(f"<p>{' '.join(paragraph_buffer)}</p>")
+            paragraph_buffer.clear()
+
+    for raw_line in str(text).strip().split("\n"):
+        line = raw_line.strip()
+        if not line:
+            flush_paragraph()
+            flush_list()
+            continue
+
+        header_match = _HEADER_RE.match(line)
+        if header_match:
+            flush_paragraph()
+            flush_list()
+            level = min(len(header_match.group(1)) + 3, 6)
+            html_parts.append(f"<h{level}>{_inline_markdown(header_match.group(2))}</h{level}>")
+            continue
+
+        bullet_match = _BULLET_RE.match(line)
+        if bullet_match:
+            flush_paragraph()
+            list_buffer.append(_inline_markdown(bullet_match.group(1)))
+            continue
+
+        flush_list()
+        paragraph_buffer.append(_inline_markdown(line))
+
+    flush_paragraph()
+    flush_list()
+    return "".join(html_parts)
 
 
 def _badge(text, kind) -> str:
@@ -97,7 +162,7 @@ def _render_test_entry(entry) -> str:
         <article class="test test-skipped">
           <div class="test-hypothesis">{number_html}{linked_html}</div>
           {_render_request_body(request)}
-          <div class="test-outcome">{_badge('skipped', 'warn')} {_esc(entry.get('skip_reason'))}</div>
+          <div class="test-outcome">{_badge('skipped', 'warn')} {_inline_markdown(entry.get('skip_reason'))}</div>
         </article>
         """
 
@@ -108,7 +173,7 @@ def _render_test_entry(entry) -> str:
     <article class="test">
       <div class="test-hypothesis">{number_html}{linked_html}</div>
       {_render_request_body(request)}
-      <div class="test-predicted">Predicted: {_esc(entry.get('predicted_outcome'))}
+      <div class="test-predicted">Predicted: {_inline_markdown(entry.get('predicted_outcome'))}
         {_latency_badge(entry.get('predicted_latency_class'))}</div>
       <div class="test-outcome">
         Actual: char_count <span class="num">{_esc(body.get('char_count'))}</span>,
@@ -141,7 +206,7 @@ def _render_casting_section(casting_log, behavior_checkpoints) -> str:
               <p class="eyebrow">Round {round_num}</p>
               <details class="reasoning" open>
                 <summary>Reasoning</summary>
-                <pre>{_esc(reasoning)}</pre>
+                <div class="prose">{_render_prose(reasoning)}</div>
               </details>
               <div class="test-grid">{tests_html}</div>
             </div>
@@ -152,19 +217,19 @@ def _render_casting_section(casting_log, behavior_checkpoints) -> str:
         if bc:
             bh = bc["behavior_hypothesis"]
             bsr = bc["behavior_skeptic_review"]
-            untested = "".join(f"<li>{_esc(a)}</li>" for a in bh.get("untested_areas", []))
-            gaps = "".join(f"<li>{_esc(g)}</li>" for g in bsr.get("gaps", []))
+            untested = "".join(f"<li>{_inline_markdown(a)}</li>" for a in bh.get("untested_areas", []))
+            gaps = "".join(f"<li>{_inline_markdown(g)}</li>" for g in bsr.get("gaps", []))
             behavior_html = f"""
             <div class="exhibit">
               <p class="eyebrow">Checkpoint {checkpoint_num} conclusion &middot; nothing anomalous found in its rounds</p>
               <h4>Behavior hypothesis</h4>
-              <p>{_esc(bh.get('observed_behavior'))}</p>
+              <div class="prose">{_render_prose(bh.get('observed_behavior'))}</div>
               <p><strong>Untested areas named by the Driver</strong></p>
               <ul>{untested}</ul>
               <h4>Behavior-Skeptic review {_verdict_badge(bsr.get('assessment'))}</h4>
               <p><strong>Gaps identified</strong></p>
               <ul>{gaps}</ul>
-              <p class="prose-muted">{_esc(bsr.get('reasoning'))}</p>
+              <div class="prose prose-muted">{_render_prose(bsr.get('reasoning'))}</div>
             </div>
             """
 
@@ -189,7 +254,7 @@ def _render_followup_rounds(followup_rounds) -> str:
           <p class="eyebrow">Follow-up round {i}
             {_verdict_badge(round_entry.get('verdict'))}
             <span class="sep">&middot;</span> continuing: {_bool_badge(round_entry.get('continue_investigation'))}</p>
-          <p>{_esc(round_entry.get('reasoning'))}</p>
+          <div class="prose">{_render_prose(round_entry.get('reasoning'))}</div>
           {test_html}
         </div>
         """)
@@ -202,7 +267,7 @@ def _render_investigation_section(output) -> str:
         return ""
 
     skeptic = output.get("skeptic_review", {})
-    strategies = "".join(f"<li>{_esc(s)}</li>" for s in skeptic.get("disproof_strategies", []))
+    strategies = "".join(f"<li>{_inline_markdown(s)}</li>" for s in skeptic.get("disproof_strategies", []))
 
     return f"""
     <section id="investigation">
@@ -211,10 +276,13 @@ def _render_investigation_section(output) -> str:
 
       <div class="exhibit">
         <h3>Claim</h3>
-        <p><strong>Observed pattern</strong><br>{_esc(hypothesis.get('observed_pattern'))}</p>
+        <p><strong>Observed pattern</strong></p>
+        <div class="prose">{_render_prose(hypothesis.get('observed_pattern'))}</div>
         <p><strong>Anomalous call index</strong><br><span class="num">{_esc(hypothesis.get('anomalous_call_index'))}</span></p>
-        <p><strong>Claim</strong><br>{_esc(hypothesis.get('claim'))}</p>
-        <p><strong>Competing explanation</strong><br>{_esc(hypothesis.get('competing_explanation'))}</p>
+        <p><strong>Claim</strong></p>
+        <div class="prose">{_render_prose(hypothesis.get('claim'))}</div>
+        <p><strong>Competing explanation</strong></p>
+        <div class="prose">{_render_prose(hypothesis.get('competing_explanation'))}</div>
         <p><strong>Severity if true</strong> {_badge(hypothesis.get('severity_if_true'), 'bad' if hypothesis.get('severity_if_true') == 'high' else 'warn')}</p>
       </div>
 
@@ -223,10 +291,11 @@ def _render_investigation_section(output) -> str:
           {_verdict_badge(skeptic.get('skeptic_verdict'))}
         </h3>
         <p><strong>Competing explanation assessed as</strong> {_verdict_badge(skeptic.get('competing_explanation_assessment'))}</p>
-        <p><strong>Skeptic's own alternative</strong><br>{_esc(skeptic.get('skeptic_alternative'))}</p>
+        <p><strong>Skeptic's own alternative</strong></p>
+        <div class="prose">{_render_prose(skeptic.get('skeptic_alternative'))}</div>
         <p><strong>Disproof strategies proposed</strong></p>
         <ul>{strategies}</ul>
-        <p class="prose-muted">{_esc(skeptic.get('reasoning'))}</p>
+        <div class="prose prose-muted">{_render_prose(skeptic.get('reasoning'))}</div>
       </div>
 
       <div class="checkpoint">
@@ -249,7 +318,7 @@ def _render_investigation_section(output) -> str:
 def _render_bug_report_section(bug_report) -> str:
     if not bug_report:
         return ""
-    steps = "".join(f"<li>{_esc(s)}</li>" for s in bug_report.get("steps_to_reproduce", []))
+    steps = "".join(f"<li>{_inline_markdown(s)}</li>" for s in bug_report.get("steps_to_reproduce", []))
     severity = bug_report.get("severity")
     status = bug_report.get("status")
     return f"""
@@ -260,14 +329,16 @@ def _render_bug_report_section(bug_report) -> str:
         <h3>{_esc(bug_report.get('title'))}</h3>
         <p>{_badge(severity, 'bad' if severity == 'high' else 'warn')}
            {_badge(status, 'good' if status == 'corroborated' else 'warn')}</p>
-        <p>{_esc(bug_report.get('description'))}</p>
+        <div class="prose">{_render_prose(bug_report.get('description'))}</div>
         <p><strong>Steps to reproduce</strong></p>
         <ol>{steps}</ol>
-        <p><strong>Expected behavior</strong><br>{_esc(bug_report.get('expected_behavior'))}</p>
-        <p><strong>Actual behavior</strong><br>{_esc(bug_report.get('actual_behavior'))}</p>
+        <p><strong>Expected behavior</strong></p>
+        <div class="prose">{_render_prose(bug_report.get('expected_behavior'))}</div>
+        <p><strong>Actual behavior</strong></p>
+        <div class="prose">{_render_prose(bug_report.get('actual_behavior'))}</div>
         <div class="caveats">
           <p><strong>Caveats</strong></p>
-          <p>{_esc(bug_report.get('caveats'))}</p>
+          <div class="prose">{_render_prose(bug_report.get('caveats'))}</div>
         </div>
       </div>
     </section>
@@ -360,9 +431,8 @@ details.reasoning summary {
   text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600;
 }
 details.reasoning summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-details.reasoning pre {
-  font-family: var(--font-body); font-size: 0.92rem; white-space: pre-wrap;
-  word-break: break-word; color: var(--ink-soft); margin: 0.6rem 0 0;
+details.reasoning .prose {
+  color: var(--ink-soft); margin: 0.6rem 0 0;
   border-left: 2px solid var(--line); padding-left: 0.85rem;
 }
 
@@ -392,6 +462,21 @@ details.reasoning pre {
   padding: 1.25rem 1.5rem; margin: 1.25rem 0;
 }
 .exhibit-final { border-color: var(--accent); border-width: 1px; }
+
+.prose { font-size: 0.94rem; }
+.prose p { margin: 0.6rem 0; }
+.prose p:first-child { margin-top: 0; }
+.prose p:last-child { margin-bottom: 0; }
+.prose h4, .prose h5, .prose h6 {
+  font-family: var(--font-body); text-transform: uppercase; letter-spacing: 0.03em;
+  color: var(--ink-soft); font-size: 0.78rem; margin: 1rem 0 0.35rem;
+}
+.prose ul { margin: 0.4rem 0; padding-left: 1.2rem; }
+.prose li { margin: 0.2rem 0; }
+.prose code {
+  font-family: var(--font-mono); font-size: 0.85em; background: var(--paper);
+  border: 1px solid var(--line); border-radius: 3px; padding: 0.05rem 0.3rem;
+}
 .prose-muted { color: var(--ink-soft); font-size: 0.92rem; }
 .caveats {
   margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--line);
