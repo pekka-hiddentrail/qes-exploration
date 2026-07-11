@@ -486,13 +486,28 @@ SKEPTIC_TOOL = {
             "verdict": {
                 "type": "string",
                 "enum": ["weak", "strong_enough"],
-                "description": "'weak' if the hypothesis (its behavior characterization and/or any anomaly claims) is not adequately supported yet. 'strong_enough' only if you genuinely have no material objection left.",
+                "description": "'weak' if the hypothesis (its behavior characterization and/or any anomaly claims) is not adequately supported yet, OR if inference_validity_check found any anomaly whose evidence doesn't actually discriminate its claimed mechanism from a real rival. 'strong_enough' only if you genuinely have no material objection left.",
             },
             "gaps": {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "At least 2 concrete gaps, untested areas, or weak assumptions - things that, if tested, might change the picture.",
                 "minItems": 2,
+            },
+            "inference_validity_check": {
+                "type": "string",
+                "description": (
+                    "For each anomaly claimed (if any): does the cited evidence actually DISCRIMINATE "
+                    "the claimed mechanism from its own stated rival explanation - i.e. would the "
+                    "evidence have come out differently if the rival were true instead - or would the "
+                    "exact same observations show up under either explanation? Evidence that is merely "
+                    "CONSISTENT with a claim (but equally consistent with a real rival) does not actually "
+                    "support that claim, no matter how many data points there are. Concretely check: "
+                    "restate the claimed mechanism, restate the rival, and ask whether the specific "
+                    "numbers/outcomes cited would differ between them. Explicitly name any anomaly that "
+                    "fails this test, and say what a genuinely discriminating test would need to show "
+                    "instead. If no anomalies were claimed, write 'n/a'."
+                ),
             },
             "anomaly_critique": {
                 "type": "string",
@@ -506,7 +521,7 @@ SKEPTIC_TOOL = {
             },
             "reasoning": {"type": "string"},
         },
-        "required": ["verdict", "gaps", "anomaly_critique", "reasoning"],
+        "required": ["verdict", "gaps", "inference_validity_check", "anomaly_critique", "reasoning"],
     },
 }
 
@@ -514,14 +529,31 @@ SKEPTIC_SYSTEM_PROMPT = """You are cold-reviewing a checkpoint hypothesis - you 
 test data, only the hypothesis itself (its behavior characterization and any anomaly claims). Your
 job is to poke holes, not confirm.
 
-Give a verdict: "weak" if the hypothesis is inadequately supported (whether that's an overconfident
-behavior characterization, an anomaly claim that isn't well justified, or a suspicious absence of any
-anomaly claim given what's been tested), or "strong_enough" only if you genuinely have no material
-objection. Identify at least 2 concrete gaps. If anomalies were claimed, give your own independent
-alternative explanation and assess whether each one's own competing explanation is genuine or a
-strawman - you propose what's worth investigating further, the Driver decides what to actually test.
-Remember this implementation may genuinely have no bugs - don't manufacture doubt just to have
-something to say, but don't rubber-stamp a thin absence-of-anomalies claim either.
+Beyond "is there enough evidence," check whether the evidence is the RIGHT KIND of evidence - this is
+a distinct failure mode from insufficient evidence, and it's easy to miss. A claim can cite several
+real, correctly-observed data points and still be unsupported, if those same data points would have
+looked identical under a rival explanation. Evidence only supports a claim over its rival if it would
+have come out DIFFERENTLY had the rival been true instead - evidence that's merely consistent with
+(but doesn't rule out) an alternative is not actually evidence for the claim, regardless of volume.
+
+For example: if a claim is "capacity resets per-transaction, not cumulatively" and the cited evidence
+is "a large purchase was declined, then smaller purchases after it were approved" - check whether that
+observation would look any different under the rival "capacity is cumulative, and the smaller purchases
+simply fit within whatever headroom remained." If the numbers involved (the decline amount, the prior
+spend, the smaller amounts) are consistent with the cumulative story too, the cited evidence does not
+actually discriminate between the two, and the claim is unsupported regardless of how confidently it's
+stated. This is exactly the kind of thing inference_validity_check exists to catch - work through it
+explicitly rather than treating "some evidence exists" as sufficient.
+
+Give a verdict: "weak" if the hypothesis is inadequately supported (an overconfident behavior
+characterization, an anomaly claim that isn't well justified, a suspicious absence of any anomaly claim
+given what's been tested, OR an anomaly whose evidence fails the inference_validity_check above), or
+"strong_enough" only if you genuinely have no material objection left. Identify at least 2 concrete
+gaps. If anomalies were claimed, give your own independent alternative explanation and assess whether
+each one's own competing explanation is genuine or a strawman - you propose what's worth investigating
+further, the Driver decides what to actually test. Remember this implementation may genuinely have no
+bugs - don't manufacture doubt just to have something to say, but don't rubber-stamp a thin
+absence-of-anomalies claim either.
 
 Call submit_skeptic_review with your answer."""
 
@@ -530,7 +562,7 @@ def validate_skeptic_response(data) -> list[str]:
     errors = []
     if not isinstance(data, dict):
         return [f"expected an object, got {type(data).__name__}"]
-    for key in ("verdict", "gaps", "anomaly_critique", "reasoning"):
+    for key in ("verdict", "gaps", "inference_validity_check", "anomaly_critique", "reasoning"):
         if key not in data:
             errors.append(f"missing required field '{key}'")
     if data.get("verdict") not in ("weak", "strong_enough"):
@@ -555,7 +587,7 @@ def get_skeptic_review(client: Anthropic, hypothesis: dict) -> dict:
         tool_name="submit_skeptic_review",
         user_message=json.dumps(evidence, indent=2),
         validate_fn=validate_skeptic_response,
-        max_tokens=1536,
+        max_tokens=2048,
     )
 
 

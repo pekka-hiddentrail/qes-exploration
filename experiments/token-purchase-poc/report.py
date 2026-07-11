@@ -219,6 +219,8 @@ def _render_checkpoint_conclusion(checkpoint_entry) -> str:
       <h4>Skeptic review {_verdict_badge(skeptic.get('verdict'))}</h4>
       <p><strong>Gaps identified</strong></p>
       <ul>{gaps}</ul>
+      <p><strong>Inference validity check</strong></p>
+      <div class="prose">{_render_prose(skeptic.get('inference_validity_check'))}</div>
       <p><strong>Anomaly critique</strong></p>
       <div class="prose">{_render_prose(skeptic.get('anomaly_critique'))}</div>
       <div class="prose prose-muted">{_render_prose(skeptic.get('reasoning'))}</div>
