@@ -75,11 +75,16 @@ cp .env.example .env   # fill in ANTHROPIC_API_KEY
 python run_live.py
 ```
 
-Writes `results/output.json` (gitignored): the schema doc, the one happy-day
-example, every casting round's reasoning and executed tests (tagged by
-checkpoint/round), `behavior_checkpoints` (behavior hypothesis + Skeptic critique
-for any checkpoint that found nothing), and if an anomaly was found: the claim,
-Skeptic review, confirm/disconfirm results, and every follow-up round. If found,
-also writes `results/bugs.json`: the final bug report.
+Writes three files under `results/` (gitignored):
+- `output.json` - the schema doc, the one happy-day example, every casting
+  round's reasoning and executed tests (tagged by checkpoint/round),
+  `behavior_checkpoints` (behavior hypothesis + Skeptic critique for any
+  checkpoint that found nothing), and if an anomaly was found: the claim,
+  Skeptic review, confirm/disconfirm results, and every follow-up round.
+- `bugs.json` - present only if an anomaly was found: the final bug report.
+- `report.html` - the same content rendered as a single self-contained,
+  human-readable page instead of raw JSON. Generated automatically at the end
+  of every run by `report.py`; rerun `python report.py` standalone to
+  regenerate it from an existing `results/` directory without a fresh live run.
 
 Score by hand against `rubric.md`.
