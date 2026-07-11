@@ -48,8 +48,8 @@ SUT_READY_TIMEOUT = 5.0
 # Raised from 1 after the first run confirmed the harness and SUT work end to end.
 MAX_CHECKPOINTS = 4
 
-FIRST_ROUND_TEST_BUDGET = 10
-DEFAULT_TEST_BUDGET = 6
+FIRST_ROUND_TEST_BUDGET = 12
+DEFAULT_TEST_BUDGET = 8
 
 KNOWN_DECLINE_REASONS = [
     "invalid_auth_token",
@@ -394,7 +394,7 @@ def get_casting_round(
         tool_name="submit_casting_round",
         user_message=json.dumps(evidence, indent=2),
         validate_fn=validate_casting_response,
-        max_tokens=3072 if test_budget <= 6 else 5120,
+        max_tokens=4096 if test_budget <= 8 else 6144,
     )
 
 
