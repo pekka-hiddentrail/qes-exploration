@@ -57,7 +57,14 @@ MAX_SAFE_ALPHA_RUN = 25
 # means measured latency is SLOW_MULTIPLIER-x what the empirical baseline rate (from
 # the real, just-measured baseline calls) would predict for that input's length, with
 # SLOW_THRESHOLD_MS as a floor so short inputs aren't flagged on noise.
-SLOW_THRESHOLD_MS = 500
+#
+# 500 was too conservative: a real run hit a genuine escalating anomaly (65ms at one
+# length, 184ms one letter longer, 339ms one more after that - a clear 5-10x elevation
+# over the linear baseline) and every one of those stayed under the 500ms floor, so
+# "slow" never fired even though the Driver's own reasoning had already recognized the
+# pattern. Every observed genuinely-normal short input has stayed under ~110ms, so 150
+# keeps a healthy margin over real noise while letting a 5x+ elevation actually cross.
+SLOW_THRESHOLD_MS = 150
 SLOW_MULTIPLIER = 5
 
 ROUNDS_PER_CHECKPOINT = 2
@@ -141,7 +148,14 @@ def redact_history_for_model(history: list[dict]) -> list[dict]:
 
 
 def call_tool_with_retry(client, *, model, system, tools, tool_name, user_message, validate_fn, max_tokens):
-    """Shared call->validate->retry loop used by every tool-forced Claude call in this file."""
+    """Shared call->validate->retry loop used by every tool-forced Claude call in this file.
+
+    Retries are informed, not blind repeats: on failure, the model's own malformed call and
+    the concrete validation errors are fed back as a tool_result before asking again, so a
+    systematic misunderstanding (e.g. an omitted required field) has a chance to self-correct
+    instead of reproducing the identical mistake on every attempt.
+    """
+    messages = [{"role": "user", "content": user_message}]
     last_errors = ["no attempts made"]
     for attempt in range(1, MAX_ATTEMPTS + 1):
         message = client.messages.create(
@@ -150,13 +164,15 @@ def call_tool_with_retry(client, *, model, system, tools, tool_name, user_messag
             system=system,
             tools=tools,
             tool_choice={"type": "tool", "name": tool_name},
-            messages=[{"role": "user", "content": user_message}],
+            messages=messages,
         )
 
         tool_use = next((block for block in message.content if block.type == "tool_use"), None)
         if tool_use is None:
             last_errors = [f"no tool_use block in response (stop_reason={message.stop_reason})"]
             print(f"  attempt {attempt} produced no tool call: {last_errors} - retrying")
+            messages.append({"role": "assistant", "content": message.content})
+            messages.append({"role": "user", "content": "You must call the tool. Try again."})
             continue
 
         errors = validate_fn(tool_use.input)
@@ -165,6 +181,16 @@ def call_tool_with_retry(client, *, model, system, tools, tool_name, user_messag
 
         last_errors = errors
         print(f"  attempt {attempt} produced malformed output: {errors} - retrying")
+        messages.append({"role": "assistant", "content": message.content})
+        messages.append({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": tool_use.id,
+                "content": "Invalid: " + "; ".join(errors) + ". Fix and call the tool again with a corrected, complete answer.",
+                "is_error": True,
+            }],
+        })
 
     raise RuntimeError(f"Gave up after {MAX_ATTEMPTS} attempts, last errors: {last_errors}")
 
@@ -197,13 +223,26 @@ def build_call_log(client: httpx.Client) -> list[dict]:
     return calls
 
 
-def baseline_rate_ms_per_char(calls: list[dict]) -> float:
-    """Empirical worst-case ms/char from the real baseline calls."""
-    rates = [
-        c["response"]["measured_latency_ms"] / max(len(c["request"]["body"]["text"]), 1)
-        for c in calls
-    ]
-    return max(rates)
+def fit_baseline_latency_model(calls: list[dict]) -> tuple[float, float]:
+    """Least-squares fit of measured latency to text length: latency_ms = intercept + slope * length.
+
+    A per-call measured/length ratio (the previous approach) conflates the fixed per-request
+    overhead with the true marginal per-char cost - for a short baseline text, the ~8ms fixed
+    overhead dominates that ratio, inflating the apparent "rate" well above the real marginal
+    slope. That inflated rate then overestimates expected latency most for short inputs -
+    exactly where this SUT's real anomaly lives, and exactly where under-sensitivity matters
+    most. A real regression separates the fixed intercept from the marginal slope instead.
+    """
+    lengths = [len(c["request"]["body"]["text"]) for c in calls]
+    latencies = [c["response"]["measured_latency_ms"] for c in calls]
+    n = len(calls)
+    sum_x = sum(lengths)
+    sum_y = sum(latencies)
+    sum_xy = sum(x * y for x, y in zip(lengths, latencies))
+    sum_x2 = sum(x * x for x in lengths)
+    slope = (n * sum_xy - sum_x * sum_y) / (n * sum_x2 - sum_x * sum_x)
+    intercept = (sum_y - slope * sum_x) / n
+    return intercept, slope
 
 
 def longest_alpha_run(text: str) -> int:
@@ -213,13 +252,14 @@ def longest_alpha_run(text: str) -> int:
     return max((len(list(group)) for is_alpha, group in itertools.groupby(text, key=str.isalpha) if is_alpha), default=0)
 
 
-def classify_latency(measured_ms: float, text_length: int, baseline_rate: float) -> str:
-    expected_ms = baseline_rate * text_length
+def classify_latency(measured_ms: float, text_length: int, baseline_model: tuple[float, float]) -> str:
+    intercept_ms, slope_ms_per_char = baseline_model
+    expected_ms = intercept_ms + slope_ms_per_char * text_length
     threshold = max(SLOW_THRESHOLD_MS, expected_ms * SLOW_MULTIPLIER)
     return "slow" if measured_ms > threshold else "fast"
 
 
-def execute_test(client: httpx.Client, test: dict, baseline_rate: float) -> dict:
+def execute_test(client: httpx.Client, test: dict, baseline_model: tuple[float, float]) -> dict:
     text = test["text"]
     request = {"method": "POST", "path": "/analyze", "body": {"text": text}}
     run_length = longest_alpha_run(text)
@@ -248,7 +288,7 @@ def execute_test(client: httpx.Client, test: dict, baseline_rate: float) -> dict
     client.get(SUT_DOCS_URL, timeout=SUT_READY_TIMEOUT)
 
     result = call_sut(client, text)
-    actual_latency_class = classify_latency(result["measured_latency_ms"], len(text), baseline_rate)
+    actual_latency_class = classify_latency(result["measured_latency_ms"], len(text), baseline_model)
     return {
         "request": request,
         "response": result,
@@ -362,6 +402,14 @@ tests_tried_in_earlier_rounds) and you still think that specific hypothesis is w
 substantially reduced/shorter version of the same idea in this round before moving on to a different
 hypothesis. A refusal doesn't mean the theory is wrong - it means that specific attempt was too
 extreme to safely run. Don't abandon a promising theory just because one attempt at it got refused.
+
+If you're testing a hypothesis about catastrophic regex backtracking (ReDoS): a repeated or patterned
+string that ends up matching a pattern cleanly is fast to process - there's no ambiguity for a regex
+engine to backtrack over, so no slowdown occurs. Catastrophic slowdown specifically requires the
+overall match to fail after a long run of ambiguity - something has to break the pattern. If a test
+of this kind came back fast, consider whether it actually included something that would cause a match
+failure, not just a longer version of a string that matches cleanly. For this class of vulnerability,
+which specific character breaks the match generally doesn't matter - what matters is that one does.
 
 If you believe you've explored reasonably and have no more good ideas worth proposing, set give_up
 to true rather than proposing something arbitrary just to have something to submit.
@@ -581,11 +629,11 @@ def get_behavior_skeptic_review(client: Anthropic, behavior_hypothesis: dict) ->
         tool_name="submit_behavior_skeptic_review",
         user_message=json.dumps(evidence, indent=2),
         validate_fn=validate_behavior_skeptic_review,
-        max_tokens=1024,
+        max_tokens=1536,
     )
 
 
-def run_checkpoint_cycle(anthropic_client: Anthropic, http_client: httpx.Client, calls: list[dict], rate: float):
+def run_checkpoint_cycle(anthropic_client: Anthropic, http_client: httpx.Client, calls: list[dict], baseline_model: tuple[float, float]):
     """Casting broken into small checkpoints. Each checkpoint runs up to
     ROUNDS_PER_CHECKPOINT rounds (same batch-propose-and-execute mechanism as before,
     same early-exit the moment a test comes back slower than the empirical baseline
@@ -639,7 +687,7 @@ def run_checkpoint_cycle(anthropic_client: Anthropic, http_client: httpx.Client,
                     "predicted_outcome": test["predicted_outcome"],
                     "predicted_latency_class": test["predicted_latency_class"],
                 }
-                result = execute_test(http_client, synthetic_test, rate)
+                result = execute_test(http_client, synthetic_test, baseline_model)
                 entry = {
                     "checkpoint": checkpoint_num,
                     "round": round_num,
@@ -1059,7 +1107,7 @@ def get_followup(client: Anthropic, hypothesis: dict, skeptic_review: dict, hist
     )
 
 
-def run_investigation(anthropic_client: Anthropic, http_client: httpx.Client, calls: list[dict], rate: float) -> dict:
+def run_investigation(anthropic_client: Anthropic, http_client: httpx.Client, calls: list[dict], baseline_model: tuple[float, float]) -> dict:
     """Everything that happens once an anomaly has been found: hypothesis formation,
     a cold Skeptic review, real confirm/disconfirm execution, and a bounded
     follow-up loop informed by real outcomes and by Skeptic's disproof strategies."""
@@ -1075,11 +1123,11 @@ def run_investigation(anthropic_client: Anthropic, http_client: httpx.Client, ca
     print(f"  skeptic verdict: {skeptic_review['skeptic_verdict']}, competing_explanation assessed as: {skeptic_review['competing_explanation_assessment']}")
 
     print("Executing confirm_test against the live SUT...")
-    confirm_result = execute_test(http_client, hypothesis["confirm_test"], rate)
+    confirm_result = execute_test(http_client, hypothesis["confirm_test"], baseline_model)
     result["confirm_result"] = confirm_result
 
     print("Executing disconfirm_test against the live SUT...")
-    disconfirm_result = execute_test(http_client, hypothesis["disconfirm_test"], rate)
+    disconfirm_result = execute_test(http_client, hypothesis["disconfirm_test"], baseline_model)
     result["disconfirm_result"] = disconfirm_result
 
     history = [
@@ -1104,7 +1152,7 @@ def run_investigation(anthropic_client: Anthropic, http_client: httpx.Client, ca
             break
 
         print(f"  executing follow-up test (round {round_num})...")
-        test_result = execute_test(http_client, followup["next_test"], rate)
+        test_result = execute_test(http_client, followup["next_test"], baseline_model)
         round_entry["test_result"] = test_result
         followup_rounds.append(round_entry)
         history.append({"round": f"followup_{round_num}", **test_result})
@@ -1254,12 +1302,12 @@ def main():
 
         print("Building baseline call log from live SUT...")
         calls = build_call_log(http_client)
-        rate = baseline_rate_ms_per_char(calls)
+        baseline_model = fit_baseline_latency_model(calls)
 
         output = {"calls": calls}
         try:
             casting_log, anomaly_entry, gave_up, behavior_checkpoints = run_checkpoint_cycle(
-                anthropic_client, http_client, calls, rate
+                anthropic_client, http_client, calls, baseline_model
             )
             output["casting_log"] = casting_log
             output["behavior_checkpoints"] = behavior_checkpoints
@@ -1284,7 +1332,7 @@ def main():
                         }
                     )
 
-                output.update(run_investigation(anthropic_client, http_client, calls_with_discovery, rate))
+                output.update(run_investigation(anthropic_client, http_client, calls_with_discovery, baseline_model))
 
                 print("Writing bug report...")
                 bug_report = get_bug_report(anthropic_client, output)
