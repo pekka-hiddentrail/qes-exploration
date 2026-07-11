@@ -772,39 +772,44 @@ def get_hypothesis(client: Anthropic, happy_day_example: dict, casting_log: list
     )
 
 
-REVISE_HYPOTHESIS_SYSTEM_PROMPT = """Skeptic has cold-reviewed your claim and found it weak - before
-any real test budget is spent on confirm/disconfirm, you must revise.
+INVESTIGATION_CHECKPOINT_SYSTEM_PROMPT = """Skeptic has cold-reviewed your claim and found it weak.
+Before writing a revised claim, gather more real evidence: propose a batch of NEW tests (up to 6)
+specifically designed to address Skeptic's critique - operationalize Skeptic's disproof_strategies
+into literal tests, and/or design tests that would distinguish your claim from Skeptic's own
+alternative explanation. You are not revising the claim in this step, only gathering evidence that
+a later step will use to re-form it - a stronger claim has to come from new data, not just better
+wording of the same data.
 
-Directly address what Skeptic found weak: either strengthen the justification for the SAME claim if
-you still believe it's right (engage specifically with Skeptic's reasoning, don't just restate the
-claim), or pivot to a different, better-supported claim informed by Skeptic's own alternative
-explanation and disproof strategies. Design new confirm_test and disconfirm_test that reflect
-whatever claim you land on - don't resubmit the same tests unchanged if the claim itself changed, and
-make sure the disconfirm test could genuinely refute the (possibly revised) claim, not a strawman of
-it.
+Don't repeat a test that's already been tried with a consistent result (check
+tests_tried_so_far) - every test in this batch should be capable of actually shifting the picture
+one way or the other. All tests will be executed for real before you see results.
 
-Call submit_hypothesis with your revised answer."""
+If you genuinely have no new test that could add evidence beyond what's already been tried, set
+give_up to true rather than proposing something arbitrary.
+
+Call submit_casting_round with your answer."""
 
 
-def revise_hypothesis(
-    client: Anthropic, happy_day_example: dict, casting_log: list[dict], prior_hypothesis: dict, skeptic_review: dict
+def get_investigation_checkpoint_round(
+    client: Anthropic, happy_day_example: dict, hypothesis: dict, skeptic_review: dict, casting_log: list[dict]
 ) -> dict:
     evidence = {
         "api_schema": API_SCHEMA_DOC,
         "happy_day_example": happy_day_example,
-        "all_tests_this_session": redact_history_for_model(casting_log),
-        "your_prior_hypothesis": prior_hypothesis,
+        "your_claim": hypothesis["claim"],
+        "your_competing_explanation": hypothesis["competing_explanation"],
         "skeptics_critique": skeptic_review,
+        "tests_tried_so_far": redact_history_for_model(casting_log),
     }
     return call_tool_with_retry(
         client,
         model=MODEL,
-        system=REVISE_HYPOTHESIS_SYSTEM_PROMPT,
-        tools=[PATTERN_TOOL],
-        tool_name="submit_hypothesis",
+        system=INVESTIGATION_CHECKPOINT_SYSTEM_PROMPT,
+        tools=[CASTING_TOOL],
+        tool_name="submit_casting_round",
         user_message=json.dumps(evidence, indent=2),
-        validate_fn=validate_hypothesis,
-        max_tokens=2048,
+        validate_fn=validate_casting_response,
+        max_tokens=3072,
     )
 
 
@@ -962,19 +967,24 @@ def get_followup(client: Anthropic, hypothesis: dict, skeptic_review: dict, hist
     )
 
 
-def run_investigation(anthropic_client: Anthropic, happy_day_example: dict, casting_log: list[dict], test_counter) -> dict:
+def run_investigation(
+    anthropic_client: Anthropic, happy_day_example: dict, casting_log: list[dict], test_counter, starting_checkpoint: int
+) -> dict:
     """Everything that happens once an anomaly has been found: hypothesis formation,
     a cold Skeptic review, real confirm/disconfirm execution, and a bounded
     follow-up loop informed by real outcomes and by Skeptic's disproof strategies.
 
     Skeptic's initial review is a real gate, not just advisory context for later:
-    a "weak" verdict sends the Driver back to revise the claim (and its
-    confirm/disconfirm tests) before any real test budget is spent, up to
-    MAX_HYPOTHESIS_ATTEMPTS total attempts. Without this, confirm/disconfirm tests
-    chosen before Skeptic ever saw the claim would execute regardless of the
-    verdict, and "weak" only ever reached the Driver as one more piece of context
-    in the optional follow-up loop - after the tests it should have prevented had
-    already run."""
+    a "weak" verdict sends the Driver back into a genuine investigation checkpoint -
+    propose and EXECUTE a new batch of real tests targeting Skeptic's specific
+    critique, exactly like a Phase A checkpoint - before the hypothesis is re-formed
+    from the expanded evidence and confirm/disconfirm ever runs. Just asking the
+    Driver to reword the same claim against the same data (an earlier version of
+    this) never actually tests anything new - a stronger claim has to come from new
+    evidence, not better wording of the old evidence. Bounded by
+    MAX_HYPOTHESIS_ATTEMPTS total attempts so this can't loop forever on cost.
+    starting_checkpoint continues the numbering from wherever Phase A's casting
+    stopped, so these show up as further checkpoints in the same sequence."""
     result = {}
 
     print("Asking Claude for a hypothesis...")
@@ -991,8 +1001,36 @@ def run_investigation(anthropic_client: Anthropic, happy_day_example: dict, cast
         if skeptic_review["skeptic_verdict"] == "holds_up" or attempt == MAX_HYPOTHESIS_ATTEMPTS:
             break
 
-        print("  Skeptic found the hypothesis weak - asking the Driver to revise before spending test budget...")
-        hypothesis = revise_hypothesis(anthropic_client, happy_day_example, casting_log, hypothesis, skeptic_review)
+        checkpoint_num = starting_checkpoint + attempt
+        print(f"  Skeptic found the hypothesis weak - running investigation checkpoint {checkpoint_num} to gather more evidence...")
+        checkpoint_round = get_investigation_checkpoint_round(anthropic_client, happy_day_example, hypothesis, skeptic_review, casting_log)
+
+        if checkpoint_round["give_up"]:
+            print(f"  Driver had no new tests to propose: {checkpoint_round['reasoning']}")
+        else:
+            print(f"  checkpoint reasoning: {checkpoint_round['reasoning']}")
+            for test in checkpoint_round["candidate_tests"]:
+                linked = test["linked_hypothesis"]
+                label = f"hypothesis: {linked}" if linked else "edge case"
+                test_number = next(test_counter)
+                mode = "concurrent" if test["concurrent"] else "sequential"
+                print(f"  test #{test_number} ({label}): client_id={test['client_id']!r} request_count={test['request_count']} ({mode}) payload={test['payload']!r}")
+
+                test_result = execute_test(test, test_number)
+                casting_log.append({
+                    "checkpoint": checkpoint_num,
+                    "round": 1,
+                    "round_reasoning": checkpoint_round["reasoning"],
+                    "linked_hypothesis": linked,
+                    **test_result,
+                })
+                if test_result.get("skipped"):
+                    print("    refused as unsafe - no signal, continuing")
+                else:
+                    print(f"    accepted {test_result['accepted_count']}/{test['request_count']} (limit {test_result['limit']}) - {test_result['actual_correctness']}")
+
+        print("Asking Claude for a revised hypothesis given the new evidence...")
+        hypothesis = get_hypothesis(anthropic_client, happy_day_example, casting_log)
 
     result["hypothesis"] = hypothesis
     result["skeptic_review"] = skeptic_review
@@ -1136,7 +1174,7 @@ def main():
             output["casting_stopped_reason"] = "gave_up" if gave_up else "checkpoints_exhausted"
         else:
             output["anomaly_found"] = True
-            output.update(run_investigation(anthropic_client, happy_day_example, casting_log, test_counter))
+            output.update(run_investigation(anthropic_client, happy_day_example, casting_log, test_counter, anomaly_entry["checkpoint"]))
 
             print("Writing bug report...")
             bug_report = get_bug_report(anthropic_client, output)
