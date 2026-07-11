@@ -24,7 +24,7 @@ def _latency_badge(latency_class) -> str:
         return _badge("slow", "bad")
     if latency_class == "fast":
         return _badge("fast", "good")
-    return _badge(latency_class or "?", "neutral")
+    return _badge(latency_class or "unknown", "warn")
 
 
 def _bool_badge(value, true_label="yes", false_label="no") -> str:
@@ -32,22 +32,22 @@ def _bool_badge(value, true_label="yes", false_label="no") -> str:
         return _badge(true_label, "good")
     if value is False:
         return _badge(false_label, "bad")
-    return _badge("?", "neutral")
+    return _badge("unknown", "warn")
 
 
 def _verdict_badge(verdict) -> str:
     kind = {
         "corroborated": "good",
         "refuted": "bad",
-        "inconclusive": "neutral",
+        "inconclusive": "warn",
         "well_supported": "good",
-        "premature": "neutral",
+        "premature": "warn",
         "holds_up": "good",
         "weak": "bad",
         "genuine": "good",
         "strawman": "bad",
-    }.get(verdict, "neutral")
-    return _badge(verdict, kind)
+    }.get(verdict, "warn")
+    return _badge(verdict.replace("_", " ") if verdict else "unknown", kind)
 
 
 def _render_request_body(request) -> str:
@@ -63,52 +63,61 @@ def _render_calls_table(calls) -> str:
         body = resp.get("body", {})
         rows.append(
             "<tr>"
-            f"<td>{_esc(call.get('index', ''))}</td>"
+            f"<td class=\"num\">{_esc(call.get('index', ''))}</td>"
             f"<td>{_render_request_body(req)}</td>"
-            f"<td>{_esc(body.get('char_count', ''))}</td>"
-            f"<td>{_esc(body.get('latency_ms', ''))}</td>"
-            f"<td>{_esc(resp.get('measured_latency_ms', ''))}</td>"
+            f"<td class=\"num\">{_esc(body.get('char_count', ''))}</td>"
+            f"<td class=\"num\">{_esc(body.get('latency_ms', ''))}</td>"
+            f"<td class=\"num\">{_esc(resp.get('measured_latency_ms', ''))}</td>"
             "</tr>"
         )
     return f"""
+    <div class="table-scroll">
     <table>
       <thead><tr><th>#</th><th>request body</th><th>char_count</th>
       <th>latency_ms (reported)</th><th>measured_latency_ms</th></tr></thead>
       <tbody>{''.join(rows)}</tbody>
     </table>
+    </div>
     """
 
 
 def _render_test_entry(entry) -> str:
+    if not entry:
+        return ""
     request = entry.get("request", {})
-    linked = entry.get("linked_hypothesis") or "<em>(pure edge-case probe, no linked hypothesis)</em>"
+    linked = entry.get("linked_hypothesis")
+    linked_html = f"<strong>Hypothesis:</strong> {_esc(linked)}" if linked else (
+        '<span class="probe-label">Edge-case probe</span> (no linked hypothesis)'
+    )
+    test_number = entry.get("test_number")
+    number_html = f'<span class="test-number">Test #{_esc(test_number)}</span>' if test_number is not None else ""
 
     if entry.get("skipped"):
         return f"""
-        <div class="test test-skipped">
-          <div class="test-hypothesis">{linked if entry.get('linked_hypothesis') is None else _esc(linked)}</div>
+        <article class="test test-skipped">
+          <div class="test-hypothesis">{number_html}{linked_html}</div>
           {_render_request_body(request)}
-          <div class="test-outcome">{_badge('skipped', 'neutral')} - {_esc(entry.get('skip_reason'))}</div>
-        </div>
+          <div class="test-outcome">{_badge('skipped', 'warn')} {_esc(entry.get('skip_reason'))}</div>
+        </article>
         """
 
     response = entry.get("response", {})
     body = response.get("body", {})
     matched = entry.get("prediction_matched")
     return f"""
-    <div class="test">
-      <div class="test-hypothesis">{linked if entry.get('linked_hypothesis') is None else _esc(linked)}</div>
+    <article class="test">
+      <div class="test-hypothesis">{number_html}{linked_html}</div>
       {_render_request_body(request)}
-      <div class="test-predicted">predicted: {_esc(entry.get('predicted_outcome'))}
-        ({_latency_badge(entry.get('predicted_latency_class'))})</div>
+      <div class="test-predicted">Predicted: {_esc(entry.get('predicted_outcome'))}
+        {_latency_badge(entry.get('predicted_latency_class'))}</div>
       <div class="test-outcome">
-        actual: char_count={_esc(body.get('char_count'))},
-        latency_ms={_esc(body.get('latency_ms'))},
-        measured={_esc(entry.get('actual_measured_latency_ms'))}ms
+        Actual: char_count <span class="num">{_esc(body.get('char_count'))}</span>,
+        latency_ms <span class="num">{_esc(body.get('latency_ms'))}</span>,
+        measured <span class="num">{_esc(entry.get('actual_measured_latency_ms'))}ms</span>
         {_latency_badge(entry.get('actual_latency_class'))}
-        &middot; prediction {_bool_badge(matched, 'matched', 'missed')}
+        <span class="sep">&middot;</span> prediction {_bool_badge(matched, 'matched', 'missed')}
       </div>
-    </div>
+    </article>
     """
 
 
@@ -129,9 +138,12 @@ def _render_casting_section(casting_log, behavior_checkpoints) -> str:
             tests_html = "".join(_render_test_entry(e) for e in entries)
             round_html.append(f"""
             <div class="round">
-              <h4>Round {round_num}</h4>
-              <div class="reasoning"><pre>{_esc(reasoning)}</pre></div>
-              {tests_html}
+              <p class="eyebrow">Round {round_num}</p>
+              <details class="reasoning" open>
+                <summary>Reasoning</summary>
+                <pre>{_esc(reasoning)}</pre>
+              </details>
+              <div class="test-grid">{tests_html}</div>
             </div>
             """)
 
@@ -143,15 +155,16 @@ def _render_casting_section(casting_log, behavior_checkpoints) -> str:
             untested = "".join(f"<li>{_esc(a)}</li>" for a in bh.get("untested_areas", []))
             gaps = "".join(f"<li>{_esc(g)}</li>" for g in bsr.get("gaps", []))
             behavior_html = f"""
-            <div class="behavior-hypothesis">
-              <h4>Behavior hypothesis (checkpoint {checkpoint_num} - nothing found in its rounds)</h4>
+            <div class="exhibit">
+              <p class="eyebrow">Checkpoint {checkpoint_num} conclusion &middot; nothing anomalous found in its rounds</p>
+              <h4>Behavior hypothesis</h4>
               <p>{_esc(bh.get('observed_behavior'))}</p>
-              <p><strong>Untested areas named by the Driver:</strong></p>
+              <p><strong>Untested areas named by the Driver</strong></p>
               <ul>{untested}</ul>
               <h4>Behavior-Skeptic review {_verdict_badge(bsr.get('assessment'))}</h4>
-              <p><strong>Gaps:</strong></p>
+              <p><strong>Gaps identified</strong></p>
               <ul>{gaps}</ul>
-              <p>{_esc(bsr.get('reasoning'))}</p>
+              <p class="prose-muted">{_esc(bsr.get('reasoning'))}</p>
             </div>
             """
 
@@ -173,8 +186,9 @@ def _render_followup_rounds(followup_rounds) -> str:
             test_html = _render_test_entry(round_entry["test_result"])
         parts.append(f"""
         <div class="followup-round">
-          <h4>Follow-up round {i} {_verdict_badge(round_entry.get('verdict'))}
-            &middot; continue: {_bool_badge(round_entry.get('continue_investigation'))}</h4>
+          <p class="eyebrow">Follow-up round {i}
+            {_verdict_badge(round_entry.get('verdict'))}
+            <span class="sep">&middot;</span> continuing: {_bool_badge(round_entry.get('continue_investigation'))}</p>
           <p>{_esc(round_entry.get('reasoning'))}</p>
           {test_html}
         </div>
@@ -191,38 +205,41 @@ def _render_investigation_section(output) -> str:
     strategies = "".join(f"<li>{_esc(s)}</li>" for s in skeptic.get("disproof_strategies", []))
 
     return f"""
-    <section>
-      <h2>Investigation (Phase B)</h2>
+    <section id="investigation">
+      <p class="eyebrow">Phase 3</p>
+      <h2>Investigation</h2>
 
-      <div class="hypothesis">
+      <div class="exhibit">
         <h3>Claim</h3>
-        <p><strong>Observed pattern:</strong> {_esc(hypothesis.get('observed_pattern'))}</p>
-        <p><strong>Anomalous call index:</strong> {_esc(hypothesis.get('anomalous_call_index'))}</p>
-        <p><strong>Claim:</strong> {_esc(hypothesis.get('claim'))}</p>
-        <p><strong>Competing explanation:</strong> {_esc(hypothesis.get('competing_explanation'))}</p>
-        <p><strong>Severity if true:</strong> {_esc(hypothesis.get('severity_if_true'))}</p>
+        <p><strong>Observed pattern</strong><br>{_esc(hypothesis.get('observed_pattern'))}</p>
+        <p><strong>Anomalous call index</strong><br><span class="num">{_esc(hypothesis.get('anomalous_call_index'))}</span></p>
+        <p><strong>Claim</strong><br>{_esc(hypothesis.get('claim'))}</p>
+        <p><strong>Competing explanation</strong><br>{_esc(hypothesis.get('competing_explanation'))}</p>
+        <p><strong>Severity if true</strong> {_badge(hypothesis.get('severity_if_true'), 'bad' if hypothesis.get('severity_if_true') == 'high' else 'warn')}</p>
       </div>
 
-      <div class="skeptic-review">
+      <div class="exhibit">
         <h3>Skeptic review of the claim
           {_verdict_badge(skeptic.get('skeptic_verdict'))}
-          &middot; competing explanation: {_verdict_badge(skeptic.get('competing_explanation_assessment'))}
         </h3>
-        <p><strong>Skeptic's own alternative:</strong> {_esc(skeptic.get('skeptic_alternative'))}</p>
-        <p><strong>Disproof strategies proposed:</strong></p>
+        <p><strong>Competing explanation assessed as</strong> {_verdict_badge(skeptic.get('competing_explanation_assessment'))}</p>
+        <p><strong>Skeptic's own alternative</strong><br>{_esc(skeptic.get('skeptic_alternative'))}</p>
+        <p><strong>Disproof strategies proposed</strong></p>
         <ul>{strategies}</ul>
-        <p>{_esc(skeptic.get('reasoning'))}</p>
+        <p class="prose-muted">{_esc(skeptic.get('reasoning'))}</p>
       </div>
 
-      <div class="confirm-disconfirm">
-        <h3>Confirm test</h3>
+      <div class="checkpoint">
+        <h3>Confirm / disconfirm</h3>
+        <p class="eyebrow">Confirm test</p>
         {_render_test_entry(output.get('confirm_result', {}))}
-        <h3>Disconfirm test</h3>
+        <p class="eyebrow">Disconfirm test</p>
         {_render_test_entry(output.get('disconfirm_result', {}))}
       </div>
 
-      <div class="followup">
-        <h3>Follow-up rounds (stopped: {_esc(output.get('followup_stopped_reason'))})</h3>
+      <div class="checkpoint">
+        <h3>Follow-up rounds</h3>
+        <p class="prose-muted">Stopped: {_esc(output.get('followup_stopped_reason'))}</p>
         {_render_followup_rounds(output.get('followup_rounds', []))}
       </div>
     </section>
@@ -233,87 +250,255 @@ def _render_bug_report_section(bug_report) -> str:
     if not bug_report:
         return ""
     steps = "".join(f"<li>{_esc(s)}</li>" for s in bug_report.get("steps_to_reproduce", []))
+    severity = bug_report.get("severity")
+    status = bug_report.get("status")
     return f"""
-    <section>
+    <section id="bug-report">
+      <p class="eyebrow">Phase 4</p>
       <h2>Bug report</h2>
-      <div class="bug-report">
-        <h3>{_esc(bug_report.get('title'))}
-          {_badge(bug_report.get('severity'), 'bad' if bug_report.get('severity') == 'high' else 'neutral')}
-          {_badge(bug_report.get('status'), 'good' if bug_report.get('status') == 'corroborated' else 'neutral')}
-        </h3>
+      <div class="exhibit exhibit-final">
+        <h3>{_esc(bug_report.get('title'))}</h3>
+        <p>{_badge(severity, 'bad' if severity == 'high' else 'warn')}
+           {_badge(status, 'good' if status == 'corroborated' else 'warn')}</p>
         <p>{_esc(bug_report.get('description'))}</p>
-        <p><strong>Steps to reproduce:</strong></p>
+        <p><strong>Steps to reproduce</strong></p>
         <ol>{steps}</ol>
-        <p><strong>Expected behavior:</strong> {_esc(bug_report.get('expected_behavior'))}</p>
-        <p><strong>Actual behavior:</strong> {_esc(bug_report.get('actual_behavior'))}</p>
-        <p><strong>Caveats:</strong> {_esc(bug_report.get('caveats'))}</p>
+        <p><strong>Expected behavior</strong><br>{_esc(bug_report.get('expected_behavior'))}</p>
+        <p><strong>Actual behavior</strong><br>{_esc(bug_report.get('actual_behavior'))}</p>
+        <div class="caveats">
+          <p><strong>Caveats</strong></p>
+          <p>{_esc(bug_report.get('caveats'))}</p>
+        </div>
       </div>
     </section>
     """
 
 
 _CSS = """
-body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; max-width: 960px;
-  margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; line-height: 1.5; }
-h1, h2, h3, h4 { line-height: 1.25; }
-h2 { border-bottom: 2px solid #ddd; padding-bottom: 0.25rem; margin-top: 3rem; }
-.checkpoint { border-left: 3px solid #ccc; padding-left: 1rem; margin: 1.5rem 0; }
-.round { margin: 1rem 0; }
-.reasoning pre, .payload { background: #f5f5f5; border-radius: 4px; padding: 0.5rem 0.75rem;
-  white-space: pre-wrap; word-break: break-word; font-size: 0.85rem; }
-.test { border: 1px solid #e0e0e0; border-radius: 6px; padding: 0.75rem; margin: 0.5rem 0; }
-.test-skipped { background: #fafafa; opacity: 0.85; }
-.test-hypothesis { font-weight: 600; margin-bottom: 0.4rem; }
-.test-predicted, .test-outcome { font-size: 0.9rem; margin-top: 0.3rem; }
-table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: 0.9rem; }
-th, td { border: 1px solid #ddd; padding: 0.4rem 0.6rem; text-align: left; vertical-align: top; }
-th { background: #f0f0f0; }
-.badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px;
-  font-size: 0.75rem; font-weight: 600; margin-left: 0.25rem; }
-.badge-good { background: #d4edda; color: #155724; }
-.badge-bad { background: #f8d7da; color: #721c24; }
-.badge-neutral { background: #e2e3e5; color: #383d41; }
-.summary { padding: 1rem; border-radius: 6px; margin-bottom: 2rem; }
-.summary-found { background: #f8d7da; }
-.summary-not-found { background: #fff3cd; }
-.summary-error { background: #f8d7da; border: 2px solid #721c24; }
-.behavior-hypothesis, .bug-report { background: #fbfbfb; border: 1px solid #e0e0e0;
-  border-radius: 6px; padding: 1rem; margin: 1rem 0; }
+:root {
+  --ink: #17262b;
+  --ink-soft: #45575d;
+  --paper: #eef2f0;
+  --panel: #ffffff;
+  --line: rgba(23, 38, 43, 0.14);
+  --accent: #0e6e76;
+  --good-bg: #dcece1; --good-fg: #205c33;
+  --bad-bg: #f6dcd8;  --bad-fg: #8c2c22;
+  --warn-bg: #f1e6cd; --warn-fg: #7a5510;
+  --code-bg: #17262b; --code-fg: #d9e6e3;
+  --font-display: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+  --font-body: -apple-system, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "SF Mono", "Cascadia Code", "Roboto Mono", Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  font-family: var(--font-body);
+  background: var(--paper);
+  color: var(--ink);
+  margin: 0;
+  line-height: 1.55;
+  font-variant-numeric: tabular-nums;
+}
+
+.wrap { max-width: 880px; margin: 0 auto; padding: 0 1.5rem 4rem; }
+
+.topbar {
+  position: sticky; top: 0; z-index: 10;
+  background: rgba(238, 242, 240, 0.92);
+  backdrop-filter: blur(6px);
+  border-bottom: 1px solid var(--line);
+}
+.topbar-inner {
+  max-width: 880px; margin: 0 auto; padding: 0.85rem 1.5rem;
+  display: flex; align-items: center; justify-content: space-between; gap: 1rem;
+  flex-wrap: wrap;
+}
+.topbar-title { font-family: var(--font-display); font-size: 1.05rem; font-weight: 600; }
+.topbar-nav { display: flex; gap: 1.25rem; list-style: none; margin: 0; padding: 0; font-size: 0.85rem; }
+.topbar-nav a {
+  color: var(--ink-soft); text-decoration: none; border-bottom: 1px solid transparent;
+}
+.topbar-nav a:hover, .topbar-nav a:focus-visible {
+  color: var(--accent); border-bottom-color: var(--accent);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .topbar-nav a { transition: color 120ms ease, border-color 120ms ease; }
+}
+
+.hero { padding: 3rem 0 1.5rem; }
+.hero h1 {
+  font-family: var(--font-display); font-size: 2.1rem; font-weight: 600;
+  margin: 0.3rem 0 1rem; text-wrap: balance;
+}
+.hero .eyebrow { margin-bottom: 0; }
+.stat-row {
+  display: flex; flex-wrap: wrap; gap: 1.75rem; padding: 1rem 1.25rem;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+}
+.stat { display: flex; flex-direction: column; gap: 0.15rem; }
+.stat .num { font-family: var(--font-mono); font-size: 1.3rem; font-weight: 600; }
+.stat .label { font-size: 0.75rem; color: var(--ink-soft); text-transform: uppercase; letter-spacing: 0.05em; }
+
+.eyebrow {
+  font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.08em;
+  color: var(--accent); font-weight: 600; margin: 0 0 0.4rem;
+}
+
+section { margin-top: 3rem; }
+h2 { font-family: var(--font-display); font-size: 1.5rem; margin: 0 0 1.25rem; text-wrap: balance; }
+h3 { font-family: var(--font-display); font-size: 1.2rem; margin: 1.5rem 0 0.5rem; }
+h4 { font-size: 1rem; margin: 1.25rem 0 0.4rem; }
+
+.checkpoint { margin: 1.75rem 0; }
+.round { margin: 1.25rem 0 1.75rem; }
+
+details.reasoning { margin: 0.5rem 0 1rem; }
+details.reasoning summary {
+  cursor: pointer; font-size: 0.8rem; color: var(--ink-soft);
+  text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600;
+}
+details.reasoning summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.reasoning pre {
+  font-family: var(--font-body); font-size: 0.92rem; white-space: pre-wrap;
+  word-break: break-word; color: var(--ink-soft); margin: 0.6rem 0 0;
+  border-left: 2px solid var(--line); padding-left: 0.85rem;
+}
+
+.test-grid { display: flex; flex-direction: column; gap: 0.6rem; }
+.test {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 4px;
+  padding: 0.85rem 1rem;
+}
+.test-skipped { background: transparent; border-style: dashed; }
+.test-hypothesis { font-size: 0.92rem; margin-bottom: 0.5rem; }
+.test-number {
+  font-family: var(--font-mono); font-size: 0.72rem; color: var(--ink-soft);
+  background: var(--paper); border: 1px solid var(--line); border-radius: 4px;
+  padding: 0.05rem 0.4rem; margin-right: 0.5rem;
+}
+.probe-label { font-style: italic; color: var(--ink-soft); }
+.payload {
+  font-family: var(--font-mono); font-size: 0.82rem; background: var(--code-bg);
+  color: var(--code-fg); border-radius: 4px; padding: 0.6rem 0.75rem; margin: 0.4rem 0;
+  white-space: pre-wrap; word-break: break-word; overflow-x: auto;
+}
+.test-predicted, .test-outcome { font-size: 0.88rem; margin-top: 0.35rem; }
+.sep { color: var(--line); margin: 0 0.15rem; }
+
+.exhibit {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+  padding: 1.25rem 1.5rem; margin: 1.25rem 0;
+}
+.exhibit-final { border-color: var(--accent); border-width: 1px; }
+.prose-muted { color: var(--ink-soft); font-size: 0.92rem; }
+.caveats {
+  margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--line);
+  font-size: 0.92rem; color: var(--ink-soft);
+}
+
+.table-scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; margin: 0.5rem 0; font-size: 0.88rem; }
+th, td { border-bottom: 1px solid var(--line); padding: 0.5rem 0.7rem; text-align: left; vertical-align: top; }
+th {
+  font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--ink-soft); font-weight: 600;
+}
+td.num, th.num { font-family: var(--font-mono); }
+.num { font-family: var(--font-mono); }
+
+.badge {
+  display: inline-block; padding: 0.12rem 0.55rem; border-radius: 999px;
+  font-size: 0.72rem; font-weight: 600; letter-spacing: 0.02em;
+}
+.badge-good { background: var(--good-bg); color: var(--good-fg); }
+.badge-bad { background: var(--bad-bg); color: var(--bad-fg); }
+.badge-warn { background: var(--warn-bg); color: var(--warn-fg); }
+
+a:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 """
 
 
+def _stat(value, label) -> str:
+    return f'<div class="stat"><span class="num">{_esc(value)}</span><span class="label">{_esc(label)}</span></div>'
+
+
 def render_report(output: dict, bug_report: dict | None) -> str:
+    calls = output.get("calls", [])
+    casting_log = output.get("casting_log", [])
+    executed = [e for e in casting_log if not e.get("skipped")]
+    skipped = [e for e in casting_log if e.get("skipped")]
+    checkpoints_run = len({e["checkpoint"] for e in casting_log}) if casting_log else 0
+
     if output.get("error"):
-        summary = f'<div class="summary summary-error"><strong>Run stopped early:</strong> {_esc(output["error"])}</div>'
+        eyebrow, title = "Run incomplete", "Stopped early"
+        stats = [_stat(output["error"][:40] + ("..." if len(output["error"]) > 40 else ""), "reason")]
     elif output.get("anomaly_found"):
-        summary = '<div class="summary summary-found"><strong>Anomaly found</strong> - see Investigation and Bug report below.</div>'
+        eyebrow, title = "Phase 4 &middot; anomaly found", (bug_report or {}).get("title", "Anomaly found")
+        stats = [
+            _stat(checkpoints_run, "checkpoints run"),
+            _stat(len(executed), "tests executed"),
+            _stat(len(skipped), "tests skipped"),
+            _stat((bug_report or {}).get("severity", "?"), "severity"),
+        ]
     else:
-        reason = output.get("casting_stopped_reason", "?")
-        summary = f'<div class="summary summary-not-found"><strong>No anomaly found</strong> ({_esc(reason)}) - see the final behavior hypothesis below.</div>'
+        reason = output.get("casting_stopped_reason", "unknown")
+        eyebrow, title = "Phase 2 &middot; casting exhausted", "No anomaly found"
+        stats = [
+            _stat(checkpoints_run, "checkpoints run"),
+            _stat(len(executed), "tests executed"),
+            _stat(len(skipped), "tests skipped"),
+            _stat(reason.replace("_", " "), "stopped because"),
+        ]
+
+    nav_items = [("#baseline", "Baseline")]
+    if casting_log:
+        nav_items.append(("#casting", "Casting"))
+    if output.get("hypothesis"):
+        nav_items.append(("#investigation", "Investigation"))
+    if bug_report:
+        nav_items.append(("#bug-report", "Bug report"))
+    nav_html = "".join(f'<li><a href="{href}">{label}</a></li>' for href, label in nav_items)
 
     return f"""<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>Live-SUT PoC Report</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live-SUT Investigation Report</title>
 <style>{_CSS}</style>
 </head>
 <body>
-<h1>Live-SUT PoC Report</h1>
-{summary}
+<div class="topbar">
+  <div class="topbar-inner">
+    <span class="topbar-title">Live-SUT Report</span>
+    <ul class="topbar-nav">{nav_html}</ul>
+  </div>
+</div>
 
-<section>
-  <h2>Baseline calls</h2>
-  {_render_calls_table(output.get('calls', []))}
-</section>
+<div class="wrap">
+  <div class="hero">
+    <p class="eyebrow">{eyebrow}</p>
+    <h1>{_esc(title)}</h1>
+    <div class="stat-row">{''.join(stats)}</div>
+  </div>
 
-<section>
-  <h2>Casting (blind discovery)</h2>
-  {_render_casting_section(output.get('casting_log', []), output.get('behavior_checkpoints', []))}
-</section>
+  <section id="baseline">
+    <p class="eyebrow">Phase 1</p>
+    <h2>Baseline calls</h2>
+    {_render_calls_table(calls)}
+  </section>
 
-{_render_investigation_section(output)}
-{_render_bug_report_section(bug_report)}
+  <section id="casting">
+    <p class="eyebrow">Phase 2</p>
+    <h2>Casting &mdash; blind discovery</h2>
+    {_render_casting_section(casting_log, output.get('behavior_checkpoints', []))}
+  </section>
+
+  {_render_investigation_section(output)}
+  {_render_bug_report_section(bug_report)}
+</div>
 </body>
 </html>
 """
