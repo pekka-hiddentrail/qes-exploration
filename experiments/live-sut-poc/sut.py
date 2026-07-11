@@ -7,11 +7,13 @@ regex that is vulnerable to catastrophic backtracking - a genuine Python `re` bu
 
 Run with: uvicorn sut:app --port 8000
 
-WARNING: /analyze contains a real exponential-time vulnerability. A run of N 'a'
-characters followed by a non-'a' character takes roughly 4x longer per +2 to N
-(measured on this machine: n=24 -> 1.6s, n=25 -> 3.6s, n=26 -> 6.6s, n=28 -> 26s).
-Don't send longer repeated-character runs than the calibrated example used by
-run_live.py, or a single request can hang for a very long time.
+WARNING: /analyze contains a real exponential-time vulnerability. A run of N letters
+(any letters, any mix of upper/lowercase - the specific characters don't matter, only
+the run length) immediately followed by one non-letter character takes roughly 2x
+longer per +1 to N once N is large enough to matter (measured on this machine:
+n=22 -> 0.5s, n=24 -> 2.2s, n=25 -> 4.8s, n=26 -> 8.9s). Don't send longer alphabetic
+runs than the calibrated example used by run_live.py, or a single request can hang
+for a very long time.
 """
 
 import re
@@ -22,8 +24,10 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-# Naive "banned repeated pattern" check - a real catastrophic-backtracking pattern.
-PATHOLOGICAL_PATTERN = re.compile(r"^(a+)+$")
+# Naive "banned long word" check - a real catastrophic-backtracking pattern. Matches
+# any run of letters (not tied to a specific character or case), so the same
+# exponential blowup fires for "aaaa...a!", "AAAA...A!", or "abcdefghij...!" alike.
+PATHOLOGICAL_PATTERN = re.compile(r"^([a-zA-Z]+)+$")
 
 BASE_LATENCY_S = 0.008
 PER_CHAR_LATENCY_S = 0.0011

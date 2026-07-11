@@ -18,8 +18,8 @@ The harness itself, however, does guard against this: Claude designs its own
 confirm/disconfirm test text, and an early run of this PoC actually hit the failure
 mode this note warns about - a proposed test used a longer repeated-character run
 than our calibrated example and hung the server for over 60 seconds (blowup is
-exponential, so a few more characters than expected turns a few-second request into
-a multi-minute one). `run_live.py` now refuses to execute any test whose text has a
+exponential, so a few more characters than expected turns a few-second request into a
+multi-minute one). `run_live.py` now refuses to execute any test whose text has a
 repeated-character run longer than the one calibrated example (25 'a's + '!', ~3.6s)
 and records it as `skipped` instead. If you manually craft a request to this endpoint
 outside the harness, that guard doesn't apply - don't send longer repeated runs.
