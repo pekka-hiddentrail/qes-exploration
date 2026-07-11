@@ -426,8 +426,23 @@ HYPOTHESIS_TOOL = {
                 "description": "At least 1-2 things not yet tried, worth trying next.",
                 "minItems": 1,
             },
+            "prior_gaps_response": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Only relevant if your evidence includes 'prior_skeptic_review' (a prior checkpoint's "
+                    "Skeptic critique naming gaps/recommended_next_tests). For EACH one it named, say "
+                    "plainly one of: it was tested this checkpoint (cite the test number), it's untestable "
+                    "with the current scenario data (state exactly why - e.g. 'no known account has two "
+                    "cards, so this can't be constructed'), it's already conclusively resolved by existing "
+                    "evidence (state why no further test could add anything), or it's simply not yet "
+                    "attempted (a genuine remaining gap). Don't declare something untestable or resolved "
+                    "just to avoid testing it - the Skeptic will judge whether your stated reason actually "
+                    "holds up. Leave empty if there was no prior review (first checkpoint)."
+                ),
+            },
         },
-        "required": ["observed_behavior", "anomalies", "untested_areas"],
+        "required": ["observed_behavior", "anomalies", "untested_areas", "prior_gaps_response"],
     },
 }
 
@@ -439,6 +454,13 @@ for the same observation (not a strawman). If nothing anomalous has turned up ye
 empty rather than forcing a claim that isn't there - this implementation may genuinely have no bugs.
 List what's still untested.
 
+If your evidence includes 'prior_skeptic_review', that Skeptic named specific gaps and recommended
+tests last checkpoint. Fill in prior_gaps_response addressing each one directly: tested (cite the test
+number), untestable with the current scenario data (say exactly why, concretely - not just "couldn't
+get to it"), already conclusively resolved (say why no further test would change anything), or not yet
+attempted. Be honest here - claiming something is untestable or resolved when it isn't will be judged
+by the Skeptic against your stated reason, not taken on faith.
+
 Call submit_checkpoint_hypothesis with your answer."""
 
 
@@ -446,7 +468,7 @@ def validate_hypothesis_response(data) -> list[str]:
     errors = []
     if not isinstance(data, dict):
         return [f"expected an object, got {type(data).__name__}"]
-    for key in ("observed_behavior", "anomalies", "untested_areas"):
+    for key in ("observed_behavior", "anomalies", "untested_areas", "prior_gaps_response"):
         if key not in data:
             errors.append(f"missing required field '{key}'")
     anomalies = data.get("anomalies")
@@ -455,16 +477,23 @@ def validate_hypothesis_response(data) -> list[str]:
     areas = data.get("untested_areas")
     if not isinstance(areas, list) or not areas or not all(isinstance(a, str) for a in areas):
         errors.append("'untested_areas' must be a non-empty list of strings")
+    prior_gaps = data.get("prior_gaps_response")
+    if not isinstance(prior_gaps, list) or not all(isinstance(g, str) for g in prior_gaps):
+        errors.append("'prior_gaps_response' must be a list of strings (may be empty)")
     return errors
 
 
-def get_checkpoint_hypothesis(client: Anthropic, happy_day_example: dict, casting_log: list[dict]) -> dict:
+def get_checkpoint_hypothesis(
+    client: Anthropic, happy_day_example: dict, casting_log: list[dict], prior_skeptic_review: dict | None = None
+) -> dict:
     evidence = {
         "api_schema": API_SCHEMA_DOC,
         "known_accounts": KNOWN_ACCOUNTS,
         "happy_day_example": happy_day_example,
         "all_tests_this_session": redact_history_for_model(casting_log),
     }
+    if prior_skeptic_review is not None:
+        evidence["prior_skeptic_review"] = prior_skeptic_review
     return call_tool_with_retry(
         client,
         model=MODEL,
@@ -473,7 +502,7 @@ def get_checkpoint_hypothesis(client: Anthropic, happy_day_example: dict, castin
         tool_name="submit_checkpoint_hypothesis",
         user_message=json.dumps(evidence, indent=2),
         validate_fn=validate_hypothesis_response,
-        max_tokens=2048,
+        max_tokens=2560,
     )
 
 
@@ -486,13 +515,28 @@ SKEPTIC_TOOL = {
             "verdict": {
                 "type": "string",
                 "enum": ["weak", "strong_enough"],
-                "description": "'weak' if the hypothesis (its behavior characterization and/or any anomaly claims) is not adequately supported yet. 'strong_enough' only if you genuinely have no material objection left.",
+                "description": "'weak' only for a MATERIAL reason: an overconfident behavior characterization, an anomaly claim that isn't well justified, a suspicious absence of any anomaly claim given what's been tested, an anomaly whose evidence fails the inference_validity_check, or a previously-raised gap that still hasn't been addressed. 'strong_enough' whenever none of those apply - routine, low-stakes untested corners in 'gaps' do NOT by themselves require 'weak'; there's always something more you could test in open-ended exploration, and naming it is not the same as having a material objection.",
             },
             "gaps": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "At least 2 concrete gaps, untested areas, or weak assumptions - things that, if tested, might change the picture.",
+                "description": "At least 2 concrete gaps, untested areas, or weak assumptions - things that, if tested, might change the picture. These are for the next checkpoint's planning; listing them does not by itself imply 'weak'.",
                 "minItems": 2,
+            },
+            "inference_validity_check": {
+                "type": "string",
+                "description": (
+                    "For each anomaly claimed (if any): does the cited evidence actually DISCRIMINATE "
+                    "the claimed mechanism from its own stated rival explanation - i.e. would the "
+                    "evidence have come out differently if the rival were true instead - or would the "
+                    "exact same observations show up under either explanation? Evidence that is merely "
+                    "CONSISTENT with a claim (but equally consistent with a real rival) does not actually "
+                    "support that claim, no matter how many data points there are. Concretely check: "
+                    "restate the claimed mechanism, restate the rival, and ask whether the specific "
+                    "numbers/outcomes cited would differ between them. Explicitly name any anomaly that "
+                    "fails this test, and say what a genuinely discriminating test would need to show "
+                    "instead. If no anomalies were claimed, write 'n/a'."
+                ),
             },
             "anomaly_critique": {
                 "type": "string",
@@ -504,9 +548,38 @@ SKEPTIC_TOOL = {
                     "what's been tested, or whether a genuinely clean result is plausible here."
                 ),
             },
+            "recommended_next_tests": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "At least 2 concrete, actionable test ideas the Driver should try next - specific "
+                    "enough to run directly (what inputs, what outcome would be informative). Prioritize "
+                    "tests that would resolve a failed inference_validity_check or close a named gap over "
+                    "generic 'test more' suggestions."
+                ),
+                "minItems": 2,
+            },
+            "prior_critique_addressed": {
+                "type": "string",
+                "description": (
+                    "Only meaningful if 'your_own_prior_review' is present in the evidence you were given "
+                    "(your own critique from the previous checkpoint). Check explicitly, using the Driver's "
+                    "'prior_gaps_response' (its own stated status for each gap you named): were the "
+                    "gaps/recommended_next_tests you named last time actually acted on with new tests, "
+                    "and for anything the Driver instead marked as untestable-with-current-data or "
+                    "already-resolved, is that stated reason actually credible - or is it hand-wavy, "
+                    "unsupported, or a way to dodge an inconvenient test? A credible untestable/resolved "
+                    "claim should NOT count against the hypothesis. An incredible one, or a gap with no "
+                    "response at all, is a material reason for 'weak' on its own. If there was no prior "
+                    "review, write 'n/a'."
+                ),
+            },
             "reasoning": {"type": "string"},
         },
-        "required": ["verdict", "gaps", "anomaly_critique", "reasoning"],
+        "required": [
+            "verdict", "gaps", "inference_validity_check", "anomaly_critique",
+            "recommended_next_tests", "prior_critique_addressed", "reasoning",
+        ],
     },
 }
 
@@ -514,14 +587,49 @@ SKEPTIC_SYSTEM_PROMPT = """You are cold-reviewing a checkpoint hypothesis - you 
 test data, only the hypothesis itself (its behavior characterization and any anomaly claims). Your
 job is to poke holes, not confirm.
 
-Give a verdict: "weak" if the hypothesis is inadequately supported (whether that's an overconfident
-behavior characterization, an anomaly claim that isn't well justified, or a suspicious absence of any
-anomaly claim given what's been tested), or "strong_enough" only if you genuinely have no material
-objection. Identify at least 2 concrete gaps. If anomalies were claimed, give your own independent
-alternative explanation and assess whether each one's own competing explanation is genuine or a
-strawman - you propose what's worth investigating further, the Driver decides what to actually test.
-Remember this implementation may genuinely have no bugs - don't manufacture doubt just to have
-something to say, but don't rubber-stamp a thin absence-of-anomalies claim either.
+Beyond "is there enough evidence," check whether the evidence is the RIGHT KIND of evidence - this is
+a distinct failure mode from insufficient evidence, and it's easy to miss. A claim can cite several
+real, correctly-observed data points and still be unsupported, if those same data points would have
+looked identical under a rival explanation. Evidence only supports a claim over its rival if it would
+have come out DIFFERENTLY had the rival been true instead - evidence that's merely consistent with
+(but doesn't rule out) an alternative is not actually evidence for the claim, regardless of volume.
+
+For example: if a claim is "capacity resets per-transaction, not cumulatively" and the cited evidence
+is "a large purchase was declined, then smaller purchases after it were approved" - check whether that
+observation would look any different under the rival "capacity is cumulative, and the smaller purchases
+simply fit within whatever headroom remained." If the numbers involved (the decline amount, the prior
+spend, the smaller amounts) are consistent with the cumulative story too, the cited evidence does not
+actually discriminate between the two, and the claim is unsupported regardless of how confidently it's
+stated. This is exactly the kind of thing inference_validity_check exists to catch - work through it
+explicitly rather than treating "some evidence exists" as sufficient.
+
+Do not conflate "I can name an untested corner" with "I have a material objection." Exploratory testing
+always has more you could try - that's what 'gaps' and 'recommended_next_tests' are for, feeding the
+next checkpoint's planning - but naming them is not itself a reason for "weak". Reserve "weak" for a
+genuine, specific reason to doubt the current hypothesis or a named anomaly claim: an inference_validity_check
+failure, an overconfident characterization the evidence doesn't support, a suspicious absence of any
+anomaly claim given what's actually been tested, or (see below) a previously-raised objection that was
+never addressed. If the strongest thing you can say is "there's always more to test," that is consistent
+with "strong_enough", not evidence against it.
+
+If the evidence you're given includes 'your_own_prior_review' (your own critique from the checkpoint
+before this one), check continuity: did the new hypothesis actually respond to what you flagged last
+time, or does it just repeat the same kind of evidence in a different direction while ignoring your
+critique? The Driver's 'prior_gaps_response' gives its own stated status for each gap you named - don't
+just take it at face value. If it claims something is untestable with the current scenario data or
+already conclusively resolved, judge whether that specific stated reason actually holds up (e.g. "no
+known account has two cards" is a real, checkable reason; "didn't get to it" or a vague gesture is not).
+A credible claim closes that gap fairly - don't keep penalizing something that genuinely cannot be
+tested further. An incredible claim, or silence on a gap you named, is itself a material reason for
+"weak", independent of anything else.
+
+Give a verdict: "weak" only for one of the material reasons above, or "strong_enough" if none apply.
+Identify at least 2 concrete gaps, and at least 2 concrete recommended_next_tests specific enough to
+run directly. If anomalies were claimed, give your own independent alternative explanation and assess
+whether each one's own competing explanation is genuine or a strawman - you propose what's worth
+investigating further, the Driver decides what to actually test. Remember this implementation may
+genuinely have no bugs - don't manufacture doubt just to have something to say, but don't rubber-stamp
+a thin absence-of-anomalies claim either.
 
 Call submit_skeptic_review with your answer."""
 
@@ -530,7 +638,11 @@ def validate_skeptic_response(data) -> list[str]:
     errors = []
     if not isinstance(data, dict):
         return [f"expected an object, got {type(data).__name__}"]
-    for key in ("verdict", "gaps", "anomaly_critique", "reasoning"):
+    required = (
+        "verdict", "gaps", "inference_validity_check", "anomaly_critique",
+        "recommended_next_tests", "prior_critique_addressed", "reasoning",
+    )
+    for key in required:
         if key not in data:
             errors.append(f"missing required field '{key}'")
     if data.get("verdict") not in ("weak", "strong_enough"):
@@ -538,15 +650,21 @@ def validate_skeptic_response(data) -> list[str]:
     gaps = data.get("gaps")
     if not isinstance(gaps, list) or len(gaps) < 2 or not all(isinstance(g, str) for g in gaps):
         errors.append("'gaps' must be a list of at least 2 strings")
+    next_tests = data.get("recommended_next_tests")
+    if not isinstance(next_tests, list) or len(next_tests) < 2 or not all(isinstance(t, str) for t in next_tests):
+        errors.append("'recommended_next_tests' must be a list of at least 2 strings")
     return errors
 
 
-def get_skeptic_review(client: Anthropic, hypothesis: dict) -> dict:
+def get_skeptic_review(client: Anthropic, hypothesis: dict, prior_skeptic_review: dict | None = None) -> dict:
     evidence = {
         "observed_behavior": hypothesis["observed_behavior"],
         "anomalies": hypothesis["anomalies"],
         "untested_areas": hypothesis["untested_areas"],
+        "prior_gaps_response": hypothesis.get("prior_gaps_response", []),
     }
+    if prior_skeptic_review is not None:
+        evidence["your_own_prior_review"] = prior_skeptic_review
     return call_tool_with_retry(
         client,
         model=MODEL,
@@ -555,7 +673,7 @@ def get_skeptic_review(client: Anthropic, hypothesis: dict) -> dict:
         tool_name="submit_skeptic_review",
         user_message=json.dumps(evidence, indent=2),
         validate_fn=validate_skeptic_response,
-        max_tokens=1536,
+        max_tokens=2560,
     )
 
 
@@ -606,13 +724,17 @@ def run_checkpoint_loop(anthropic_client: Anthropic, happy_day_example: dict, te
                 })
                 print(f"    actual: {result['actual_status']}" + (f" ({result['actual_decline_reason']})" if result['actual_decline_reason'] else "") + f" - prediction {'matched' if result['prediction_matched'] else 'MISSED'}")
 
+        prior_skeptic_review = prior_feedback["skeptic_review"] if prior_feedback else None
+
         print(f"Checkpoint {checkpoint_num}: forming a hypothesis...")
-        hypothesis = get_checkpoint_hypothesis(anthropic_client, happy_day_example, casting_log)
+        hypothesis = get_checkpoint_hypothesis(anthropic_client, happy_day_example, casting_log, prior_skeptic_review)
         print(f"  observed_behavior: {hypothesis['observed_behavior']}")
         print(f"  anomalies noticed: {len(hypothesis['anomalies'])}")
+        if hypothesis["prior_gaps_response"]:
+            print(f"  prior gaps responded to: {len(hypothesis['prior_gaps_response'])}")
 
         print("Asking Skeptic for a cold review...")
-        skeptic_review = get_skeptic_review(anthropic_client, hypothesis)
+        skeptic_review = get_skeptic_review(anthropic_client, hypothesis, prior_skeptic_review)
         print(f"  skeptic verdict: {skeptic_review['verdict']}")
 
         checkpoints.append({"checkpoint": checkpoint_num, "hypothesis": hypothesis, "skeptic_review": skeptic_review})

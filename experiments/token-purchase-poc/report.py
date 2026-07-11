@@ -197,6 +197,24 @@ def _render_checkpoint_conclusion(checkpoint_entry) -> str:
     anomalies = hypothesis.get("anomalies", [])
     untested = "".join(f"<li>{_inline_markdown(a)}</li>" for a in hypothesis.get("untested_areas", []))
     gaps = "".join(f"<li>{_inline_markdown(g)}</li>" for g in skeptic.get("gaps", []))
+    next_tests = "".join(f"<li>{_inline_markdown(t)}</li>" for t in skeptic.get("recommended_next_tests", []))
+
+    prior_gaps_html = ""
+    prior_gaps_response = hypothesis.get("prior_gaps_response", [])
+    if prior_gaps_response:
+        prior_gaps_items = "".join(f"<li>{_inline_markdown(g)}</li>" for g in prior_gaps_response)
+        prior_gaps_html = f"""
+        <p><strong>Driver's response to the prior checkpoint's named gaps</strong></p>
+        <ul>{prior_gaps_items}</ul>
+        """
+
+    prior_critique_html = ""
+    prior_critique = skeptic.get("prior_critique_addressed")
+    if prior_critique and prior_critique.strip().lower() != "n/a":
+        prior_critique_html = f"""
+        <p><strong>Was the Skeptic's own prior critique addressed?</strong></p>
+        <div class="prose">{_render_prose(prior_critique)}</div>
+        """
 
     anomalies_html = ""
     if anomalies:
@@ -216,11 +234,17 @@ def _render_checkpoint_conclusion(checkpoint_entry) -> str:
       {anomalies_html}
       <p><strong>Untested areas named by the Driver</strong></p>
       <ul>{untested}</ul>
+      {prior_gaps_html}
       <h4>Skeptic review {_verdict_badge(skeptic.get('verdict'))}</h4>
       <p><strong>Gaps identified</strong></p>
       <ul>{gaps}</ul>
+      <p><strong>Inference validity check</strong></p>
+      <div class="prose">{_render_prose(skeptic.get('inference_validity_check'))}</div>
       <p><strong>Anomaly critique</strong></p>
       <div class="prose">{_render_prose(skeptic.get('anomaly_critique'))}</div>
+      <p><strong>Recommended next tests</strong></p>
+      <ul>{next_tests}</ul>
+      {prior_critique_html}
       <div class="prose prose-muted">{_render_prose(skeptic.get('reasoning'))}</div>
     </div>
     """
