@@ -33,6 +33,8 @@ import httpx
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+from report import render_report
+
 # Model-generated text (reasoning, probes) can contain non-ASCII characters (e.g. "~=")
 # that the default Windows console codec can't encode, crashing a plain print().
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -259,16 +261,17 @@ def classify_latency(measured_ms: float, text_length: int, baseline_model: tuple
     return "slow" if measured_ms > threshold else "fast"
 
 
-def execute_test(client: httpx.Client, test: dict, baseline_model: tuple[float, float]) -> dict:
+def execute_test(client: httpx.Client, test: dict, baseline_model: tuple[float, float], test_number: int) -> dict:
     text = test["text"]
     request = {"method": "POST", "path": "/analyze", "body": {"text": text}}
     run_length = longest_alpha_run(text)
     if run_length > MAX_SAFE_ALPHA_RUN:
         print(
-            f"  refusing to execute: longest alphabetic run is {run_length}, "
+            f"  refusing to execute test #{test_number}: longest alphabetic run is {run_length}, "
             f"exceeds safe ceiling of {MAX_SAFE_ALPHA_RUN}"
         )
         return {
+            "test_number": test_number,
             "request": request,
             "predicted_outcome": test["predicted_outcome"],
             "predicted_latency_class": test["predicted_latency_class"],
@@ -290,6 +293,7 @@ def execute_test(client: httpx.Client, test: dict, baseline_model: tuple[float, 
     result = call_sut(client, text)
     actual_latency_class = classify_latency(result["measured_latency_ms"], len(text), baseline_model)
     return {
+        "test_number": test_number,
         "request": request,
         "response": result,
         "predicted_outcome": test["predicted_outcome"],
@@ -633,7 +637,7 @@ def get_behavior_skeptic_review(client: Anthropic, behavior_hypothesis: dict) ->
     )
 
 
-def run_checkpoint_cycle(anthropic_client: Anthropic, http_client: httpx.Client, calls: list[dict], baseline_model: tuple[float, float]):
+def run_checkpoint_cycle(anthropic_client: Anthropic, http_client: httpx.Client, calls: list[dict], baseline_model: tuple[float, float], test_counter):
     """Casting broken into small checkpoints. Each checkpoint runs up to
     ROUNDS_PER_CHECKPOINT rounds (same batch-propose-and-execute mechanism as before,
     same early-exit the moment a test comes back slower than the empirical baseline
@@ -680,14 +684,15 @@ def run_checkpoint_cycle(anthropic_client: Anthropic, http_client: httpx.Client,
                 text = unwrap_accidental_json_body(test["text"])
                 linked = test["linked_hypothesis"]
                 label = f"hypothesis: {linked}" if linked else "edge case"
-                print(f"  test ({label}): {text!r}")
+                test_number = next(test_counter)
+                print(f"  test #{test_number} ({label}): {text!r}")
 
                 synthetic_test = {
                     "text": text,
                     "predicted_outcome": test["predicted_outcome"],
                     "predicted_latency_class": test["predicted_latency_class"],
                 }
-                result = execute_test(http_client, synthetic_test, baseline_model)
+                result = execute_test(http_client, synthetic_test, baseline_model, test_number)
                 entry = {
                     "checkpoint": checkpoint_num,
                     "round": round_num,
@@ -1107,7 +1112,7 @@ def get_followup(client: Anthropic, hypothesis: dict, skeptic_review: dict, hist
     )
 
 
-def run_investigation(anthropic_client: Anthropic, http_client: httpx.Client, calls: list[dict], baseline_model: tuple[float, float]) -> dict:
+def run_investigation(anthropic_client: Anthropic, http_client: httpx.Client, calls: list[dict], baseline_model: tuple[float, float], test_counter) -> dict:
     """Everything that happens once an anomaly has been found: hypothesis formation,
     a cold Skeptic review, real confirm/disconfirm execution, and a bounded
     follow-up loop informed by real outcomes and by Skeptic's disproof strategies."""
@@ -1123,11 +1128,11 @@ def run_investigation(anthropic_client: Anthropic, http_client: httpx.Client, ca
     print(f"  skeptic verdict: {skeptic_review['skeptic_verdict']}, competing_explanation assessed as: {skeptic_review['competing_explanation_assessment']}")
 
     print("Executing confirm_test against the live SUT...")
-    confirm_result = execute_test(http_client, hypothesis["confirm_test"], baseline_model)
+    confirm_result = execute_test(http_client, hypothesis["confirm_test"], baseline_model, next(test_counter))
     result["confirm_result"] = confirm_result
 
     print("Executing disconfirm_test against the live SUT...")
-    disconfirm_result = execute_test(http_client, hypothesis["disconfirm_test"], baseline_model)
+    disconfirm_result = execute_test(http_client, hypothesis["disconfirm_test"], baseline_model, next(test_counter))
     result["disconfirm_result"] = disconfirm_result
 
     history = [
@@ -1152,7 +1157,7 @@ def run_investigation(anthropic_client: Anthropic, http_client: httpx.Client, ca
             break
 
         print(f"  executing follow-up test (round {round_num})...")
-        test_result = execute_test(http_client, followup["next_test"], baseline_model)
+        test_result = execute_test(http_client, followup["next_test"], baseline_model, next(test_counter))
         round_entry["test_result"] = test_result
         followup_rounds.append(round_entry)
         history.append({"round": f"followup_{round_num}", **test_result})
@@ -1305,9 +1310,11 @@ def main():
         baseline_model = fit_baseline_latency_model(calls)
 
         output = {"calls": calls}
+        bug_report = None
+        test_counter = itertools.count(1)
         try:
             casting_log, anomaly_entry, gave_up, behavior_checkpoints = run_checkpoint_cycle(
-                anthropic_client, http_client, calls, baseline_model
+                anthropic_client, http_client, calls, baseline_model, test_counter
             )
             output["casting_log"] = casting_log
             output["behavior_checkpoints"] = behavior_checkpoints
@@ -1332,7 +1339,7 @@ def main():
                         }
                     )
 
-                output.update(run_investigation(anthropic_client, http_client, calls_with_discovery, baseline_model))
+                output.update(run_investigation(anthropic_client, http_client, calls_with_discovery, baseline_model, test_counter))
 
                 print("Writing bug report...")
                 bug_report = get_bug_report(anthropic_client, output)
@@ -1346,6 +1353,11 @@ def main():
             output["error"] = str(e)
 
     write_output(output)
+
+    report_path = out_dir / "report.html"
+    report_path.write_text(render_report(output, bug_report), encoding="utf-8")
+    print(f"Wrote report to {report_path}")
+
     if "error" not in output:
         if output.get("anomaly_found"):
             print("Now score it by hand against rubric.md.")
