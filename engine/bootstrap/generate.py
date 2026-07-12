@@ -131,9 +131,9 @@ def _render_validator_source(endpoint) -> str:
         for f in endpoint.request_fields
     ]
     metadata_literal = pprint.pformat(field_metadata, sort_dicts=False, width=100)
-    field_names = [f.name for f in endpoint.request_fields]
+    required_field_names = [f.name for f in endpoint.request_fields if f.required]
     required_keys_literal = pprint.pformat(
-        ["linked_hypothesis", *field_names, "predicted_outcome", "predicted_status_family"],
+        ["linked_hypothesis", *required_field_names, "predicted_outcome", "predicted_status_family"],
         sort_dicts=False, width=100,
     )
 
