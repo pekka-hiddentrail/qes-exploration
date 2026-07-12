@@ -92,6 +92,10 @@ def validate_schema_draft_response(data) -> list[str]:
         if key not in data:
             errors.append(f"missing required field '{key}'")
 
+    if "endpoint_path" in data and not isinstance(data.get("endpoint_path"), str):
+        errors.append("'endpoint_path' must be a string")
+    if "confidence_notes" in data and not isinstance(data.get("confidence_notes"), str):
+        errors.append("'confidence_notes' must be a string")
     if data.get("method") not in ("GET", "POST", "PUT", "PATCH", "DELETE"):
         errors.append("'method' must be one of GET/POST/PUT/PATCH/DELETE")
 
