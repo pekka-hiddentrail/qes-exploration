@@ -5,7 +5,6 @@ checkpoints survive on disk rather than being lost with the crash. No
 network calls: the SUT readiness probe, happy-day fetch, and the three
 Anthropic-calling functions inside the loop are all stubbed."""
 
-import itertools
 import json
 
 import httpx
