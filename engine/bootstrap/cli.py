@@ -34,6 +34,10 @@ def main() -> None:
     parser.add_argument("--max-probes", type=int, default=8, dest="max_probes")
     args = parser.parse_args()
 
+    import keyword
+    if not args.name.isidentifier() or keyword.iskeyword(args.name):
+        raise SystemExit("--name must be a valid Python identifier (not a keyword), e.g. 'my_api'")
+
     anthropic_client = build_client()
 
     print(f"[1/3] Discovering schema at {args.base_url} ...")
