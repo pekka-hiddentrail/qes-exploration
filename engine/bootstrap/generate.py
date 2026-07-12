@@ -68,7 +68,8 @@ def _build_casting_tool(endpoint) -> dict:
     required = ["linked_hypothesis"]
     for f in endpoint.request_fields:
         item_properties[f.name] = _field_json_schema_property(f)
-        required.append(f.name)
+        if f.required:
+            required.append(f.name)
     item_properties["predicted_outcome"] = {"type": "string", "description": "What you predict will happen and why."}
     item_properties["predicted_status_family"] = {
         "type": "string",
