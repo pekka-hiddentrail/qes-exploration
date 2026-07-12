@@ -86,9 +86,10 @@ def discover_schema(base_url: str, timeout: float = 5.0, client: httpx.Client | 
 
     got_any_http_response = False
     try:
+        base = base_url.rstrip("/")
         for candidate in CANDIDATE_PATHS:
             try:
-                response = client.get(base_url + candidate)
+                response = client.get(f"{base}{candidate}", follow_redirects=True)
             except httpx.HTTPError:
                 continue
             got_any_http_response = True
