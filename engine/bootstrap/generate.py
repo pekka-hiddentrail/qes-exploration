@@ -195,6 +195,9 @@ def generate_adapter_source(name: str, display_name: str, base_url: str, bootstr
     if not bootstrap_result.happy_day_example:
         raise ValueError("bootstrap_result has no happy_day_example - cannot generate a HAPPY_DAY_REQUEST from it.")
 
+    if not bootstrap_result.schema.endpoints:
+        raise ValueError("bootstrap_result.schema has no endpoints - cannot generate an adapter.")
+
     endpoint = bootstrap_result.schema.endpoints[0]
     casting_tool = _build_casting_tool(endpoint)
     casting_tool_literal = pprint.pformat(casting_tool, sort_dicts=False, width=100)
