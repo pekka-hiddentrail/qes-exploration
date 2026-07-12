@@ -90,6 +90,11 @@ def test_generated_validator_rejects_missing_required_fields(tmp_path, monkeypat
         generate_adapter_source("gen_validator_missing", "Gen Validator Missing", "http://test", _confirmed_result()),
     )
 
+    missing_required = {
+        "linked_hypothesis": "", "client_id": "a", "priority": "normal",
+        "predicted_outcome": "ok",
+    }
+    errors = module.validate_casting_response({"give_up": False, "reasoning": "r", "candidate_tests": [missing_required]})
     assert any("payload" in e for e in errors)
     assert any("predicted_status_family" in e for e in errors)
     assert not any("priority" in e and "missing" in e for e in errors)
