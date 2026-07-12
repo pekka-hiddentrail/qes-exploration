@@ -135,6 +135,37 @@ def test_discover_schema_malformed_when_document_has_no_paths():
     assert result.error is not None
 
 
+def test_discover_schema_survives_non_dict_components():
+    # "components" present but malformed (a list, not a dict) shouldn't crash
+    # discovery outright - only matters if a $ref actually needs it, which
+    # this inline (ref-free) request schema doesn't.
+    doc = _openapi_doc({"type": "object", "properties": {"x": {"type": "string"}}})
+    doc["components"] = ["not", "a", "dict"]
+
+    def handler(request):
+        if request.url.path == "/openapi.json":
+            return httpx.Response(200, json=doc)
+        return httpx.Response(404)
+
+    result = discover_schema("http://test", client=_client_for(handler))
+    assert result.status == "found"
+    assert [f.name for f in result.endpoints[0].request_fields] == ["x"]
+
+
+def test_discover_schema_survives_non_dict_responses():
+    doc = _openapi_doc({"type": "object", "properties": {}})
+    doc["paths"]["/x"]["post"]["responses"] = ["not", "a", "dict"]
+
+    def handler(request):
+        if request.url.path == "/openapi.json":
+            return httpx.Response(200, json=doc)
+        return httpx.Response(404)
+
+    result = discover_schema("http://test", client=_client_for(handler))
+    assert result.status == "found"
+    assert result.endpoints[0].response_fields == []
+
+
 def test_discover_schema_handles_self_referential_ref_cycle_without_hanging():
     doc = _openapi_doc(
         {"$ref": "#/components/schemas/Node"},
