@@ -7,6 +7,7 @@ import importlib
 
 _ADAPTERS = {
     "token_purchase": "engine.adapters.token_purchase.adapter",
+    "complex_sut": "engine.adapters.complex_sut.adapter",
 }
 
 
