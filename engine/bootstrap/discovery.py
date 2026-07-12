@@ -161,7 +161,8 @@ def _extract_json_schema(container: dict) -> dict:
     if not isinstance(content, dict):
         return {}
     json_content = content.get("application/json", {})
-    return json_content.get("schema", {}) if isinstance(json_content, dict) else {}
+    schema = json_content.get("schema", {}) if isinstance(json_content, dict) else {}
+    return schema if isinstance(schema, dict) else {}
 
 
 def _resolve_refs(schema: dict, components_schemas: dict, seen: frozenset = frozenset()) -> dict:
