@@ -37,9 +37,7 @@ FREETEXT_SCHEMA_TOOL = {
     "input_schema": {
         "type": "object",
         "properties": {
-            "endpoint_path": {"type": "string", "description": "Best guess at the endpoint path, e.g. '/submit'."},
-            "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"]},
-            "request_fields": {
+            "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]},
                 "type": "array",
                 "description": "Fields the request body appears to need, based on the text.",
                 "items": _FIELD_SCHEMA,
