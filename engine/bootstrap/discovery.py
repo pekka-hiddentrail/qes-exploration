@@ -133,7 +133,8 @@ def _parse_openapi_document(document: dict) -> list[DiscoveredEndpoint]:
         raise _MalformedOpenAPIError("document has no usable 'paths'")
 
     components = document.get("components", {})
-    components_schemas = components.get("schemas", {}) if isinstance(components, dict) else {}
+    schemas = components.get("schemas", {}) if isinstance(components, dict) else {}
+    components_schemas = schemas if isinstance(schemas, dict) else {}
     endpoints = []
     for path, path_item in paths.items():
         if not isinstance(path_item, dict):
