@@ -54,6 +54,13 @@ class DiscoveredSchema:
     fetched_from: str | None  # which candidate path succeeded, e.g. "/openapi.json"
     endpoints: list[DiscoveredEndpoint] = field(default_factory=list)
     error: str | None = None  # populated only when status == "malformed"
+    source: str = "openapi"  # "openapi" | "freetext" - where this schema came from
+    # False for a Phase 2 free-text draft: it hasn't been verified against
+    # the real system yet, unlike a Phase 1 openapi-derived result, which
+    # was deterministically parsed from something the live SUT itself
+    # actually returned.
+    confirmed: bool = True
+    notes: str = ""  # free-form commentary, e.g. an LLM's own confidence caveats
 
 
 class _MalformedOpenAPIError(Exception):
