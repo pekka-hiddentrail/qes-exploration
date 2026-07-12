@@ -113,8 +113,11 @@ def validate_schema_draft_response(data) -> list[str]:
                 errors.append(f"{list_key}[{i}].type must be a valid JSON Schema type")
             if not isinstance(item.get("required"), bool):
                 errors.append(f"{list_key}[{i}].required must be a boolean")
-            if not isinstance(item.get("enum"), list):
-                errors.append(f"{list_key}[{i}].enum must be a list")
+            enum = item.get("enum")
+            if not isinstance(enum, list) or not all(isinstance(v, str) for v in enum):
+                errors.append(f"{list_key}[{i}].enum must be a list of strings")
+            if not isinstance(item.get("description"), str):
+                errors.append(f"{list_key}[{i}].description must be a string")
 
     return errors
 
