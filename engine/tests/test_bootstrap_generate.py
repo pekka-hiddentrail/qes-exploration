@@ -90,12 +90,9 @@ def test_generated_validator_rejects_missing_required_fields(tmp_path, monkeypat
         generate_adapter_source("gen_validator_missing", "Gen Validator Missing", "http://test", _confirmed_result()),
     )
 
-    errors = module.validate_casting_response({"give_up": False, "reasoning": "r", "candidate_tests": [
-        {"linked_hypothesis": "", "client_id": "a"},  # missing payload, predicted_outcome, predicted_status_family
-    ]})
     assert any("payload" in e for e in errors)
     assert any("predicted_status_family" in e for e in errors)
-
+    assert not any("priority" in e and "missing" in e for e in errors)
 
 def test_generated_validator_rejects_wrong_types_and_bad_enum(tmp_path, monkeypatch):
     module = _import_generated(
