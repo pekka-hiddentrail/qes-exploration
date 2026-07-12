@@ -169,10 +169,12 @@ def _resolve_refs(schema: dict, components_schemas: dict, seen: frozenset = froz
     if not isinstance(schema, dict):
         return schema
 
+    if "$ref" in schema:
         ref = schema["$ref"]
         if not isinstance(ref, str) or not ref.startswith("#/components/schemas/"):
             raise _MalformedOpenAPIError(f"unsupported $ref '{ref}' (only #/components/schemas/* supported)")
         name = ref.rsplit("/", 1)[-1]
+        if name in seen:
             # A genuine self-reference cycle - stop expanding rather than
             # recursing forever. Treated as opaque, not an error: the rest
             # of the schema might still be perfectly usable.
