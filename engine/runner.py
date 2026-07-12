@@ -50,7 +50,9 @@ def run(adapter: SUTAdapter, run_config: RunConfig) -> dict:
         output["casting_log"] = casting_log
         output["checkpoints"] = checkpoints
         output["stopped_reason"] = "in_progress"
-        out_path.write_text(json.dumps(output, indent=2))
+        tmp_path = out_path.with_name(out_path.name + ".tmp")
+        tmp_path.write_text(json.dumps(output, indent=2))
+        tmp_path.replace(out_path)
 
     try:
         casting_log, checkpoints, stopped_reason = run_checkpoint_loop(
