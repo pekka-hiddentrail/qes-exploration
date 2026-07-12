@@ -37,7 +37,12 @@ FREETEXT_SCHEMA_TOOL = {
     "input_schema": {
         "type": "object",
         "properties": {
+            "endpoint_path": {
+                "type": "string",
+                "description": "Path of the endpoint, e.g. /submit",
+            },
             "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]},
+            "request_fields": {
                 "type": "array",
                 "description": "Fields the request body appears to need, based on the text.",
                 "items": _FIELD_SCHEMA,
@@ -58,7 +63,7 @@ FREETEXT_SCHEMA_TOOL = {
                     "schema is a draft that still needs to be confirmed against the real system."
                 ),
             },
-        },
+        }
         "required": ["endpoint_path", "method", "request_fields", "response_fields", "confidence_notes"],
     },
 }
