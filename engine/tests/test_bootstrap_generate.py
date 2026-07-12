@@ -99,6 +99,7 @@ def test_generated_validator_rejects_missing_required_fields(tmp_path, monkeypat
     assert any("predicted_status_family" in e for e in errors)
     assert not any("priority" in e and "missing" in e for e in errors)
 
+
 def test_generated_validator_rejects_wrong_types_and_bad_enum(tmp_path, monkeypatch):
     module = _import_generated(
         tmp_path, monkeypatch, "gen_validator_types",
