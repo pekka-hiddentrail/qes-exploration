@@ -206,8 +206,7 @@ def run_checkpoint_loop(
         checkpoints.append({"checkpoint": checkpoint_num, "hypothesis": hypothesis, "skeptic_review": skeptic_review})
 
         if on_checkpoint is not None:
-            on_checkpoint(casting_log, checkpoints)
-
+            on_checkpoint(list(casting_log), list(checkpoints))
         if skeptic_review["verdict"] == "strong_enough":
             stopped_reason = "skeptic_satisfied"
             break
