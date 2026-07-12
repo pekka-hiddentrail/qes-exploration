@@ -352,7 +352,14 @@ ADAPTER = SUTAdapter(
 
 
 def write_adapter_module(output_dir: Path, name: str, source: str) -> Path:
-    module_dir = output_dir / name
+    if not name.isidentifier() or "/" in name or "\\" in name:
+        raise ValueError(f"Invalid adapter name '{name}' (must be a valid Python identifier, e.g. 'my_api').")
+
+    output_root = output_dir.resolve()
+    module_dir = (output_dir / name).resolve()
+    if output_root not in module_dir.parents:
+        raise ValueError(f"Refusing to write adapter outside {output_root} (got name={name!r}).")
+
     module_dir.mkdir(parents=True, exist_ok=True)
     (module_dir / "__init__.py").write_text("", encoding="utf-8")
     adapter_path = module_dir / "adapter.py"
