@@ -125,7 +125,8 @@ def _parse_openapi_document(document: dict) -> list[DiscoveredEndpoint]:
     if not isinstance(paths, dict) or not paths:
         raise _MalformedOpenAPIError("document has no usable 'paths'")
 
-    components_schemas = document.get("components", {}).get("schemas", {})
+    components = document.get("components", {})
+    components_schemas = components.get("schemas", {}) if isinstance(components, dict) else {}
     endpoints = []
     for path, path_item in paths.items():
         if not isinstance(path_item, dict):
@@ -136,7 +137,8 @@ def _parse_openapi_document(document: dict) -> list[DiscoveredEndpoint]:
                 continue
 
             request_schema = _extract_json_schema(operation.get("requestBody", {}))
-            response_schema = _extract_json_schema(operation.get("responses", {}).get("200", {}))
+            responses = operation.get("responses", {})
+            response_schema = _extract_json_schema(responses.get("200", {}) if isinstance(responses, dict) else {})
             resolved_request = _resolve_refs(request_schema, components_schemas)
             resolved_response = _resolve_refs(response_schema, components_schemas)
 
