@@ -305,6 +305,8 @@ def run_bootstrap_probe_loop(
     """on_probe(probe_log), if given, is called after every round - not just
     once at the end - mirroring run_checkpoint_loop's on_checkpoint pattern,
     so a crash partway through doesn't discard probes that already ran."""
+    if not initial_schema.endpoints:
+        raise ValueError("initial_schema has no endpoints to probe - pass a schema with status == 'found'")
     endpoint = initial_schema.endpoints[0]
     probe_log: list[dict] = []
     happy_day_example: dict | None = None
@@ -349,12 +351,21 @@ def run_bootstrap_probe_loop(
                 ),
                 probe_log=probe_log,
                 happy_day_example=happy_day_example,
+                notes=review["reasoning"],
             )
 
+    # Carry the last review's reasoning forward rather than silently dropping
+    # it - a human reading an inconclusive/failed result needs to know *why*
+    # it stopped there, not just that it did. prior_review is None only if
+    # give_up was set on the very first probe (zero rounds ever completed).
+    final_notes = prior_review["reasoning"] if prior_review is not None else ""
     final_schema = DiscoveredSchema(
         status="found", fetched_from=None, endpoints=[_build_endpoint(endpoint, latest_fields)],
-        source=initial_schema.source, confirmed=False,
+        source=initial_schema.source, confirmed=False, notes=final_notes,
     )
     if had_success:
-        return BootstrapResult(status="inconclusive", schema=final_schema, probe_log=probe_log, happy_day_example=happy_day_example)
-    return BootstrapResult(status="failed", schema=final_schema, probe_log=probe_log, happy_day_example=None)
+        return BootstrapResult(
+            status="inconclusive", schema=final_schema, probe_log=probe_log,
+            happy_day_example=happy_day_example, notes=final_notes,
+        )
+    return BootstrapResult(status="failed", schema=final_schema, probe_log=probe_log, happy_day_example=None, notes=final_notes)

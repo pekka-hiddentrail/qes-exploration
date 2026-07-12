@@ -86,7 +86,7 @@ def _transport_always(status_code):
 def test_confirmed_after_one_successful_round():
     client = _FakeAnthropicClient([
         _tool_response("p1", _canned_probe()),
-        _tool_response("r1", _canned_review(verdict="confident_enough")),
+        _tool_response("r1", _canned_review(verdict="confident_enough", reasoning="looks solid now")),
     ])
     result = run_bootstrap_probe_loop(client, "http://test", _initial_schema(), max_probes=5, transport=_transport_always(200))
 
@@ -95,6 +95,51 @@ def test_confirmed_after_one_successful_round():
     assert result.schema.confirmed is True
     assert result.happy_day_example is not None
     assert len(result.probe_log) == 1
+    # The reviewer's own reasoning shouldn't be silently dropped - both the
+    # result and its schema should carry it forward.
+    assert result.notes == "looks solid now"
+    assert result.schema.notes == "looks solid now"
+
+
+def test_inconclusive_result_carries_forward_the_last_review_reasoning():
+    client = _FakeAnthropicClient([
+        _tool_response("p1", _canned_probe()),
+        _tool_response("r1", _canned_review(verdict="needs_more_probing", reasoning="still missing a field")),
+    ])
+    result = run_bootstrap_probe_loop(client, "http://test", _initial_schema(), max_probes=1, transport=_transport_always(200))
+
+    assert result.status == "inconclusive"
+    assert result.notes == "still missing a field"
+    assert result.schema.notes == "still missing a field"
+
+
+def test_failed_result_carries_forward_the_last_review_reasoning():
+    client = _FakeAnthropicClient([
+        _tool_response("p1", _canned_probe()),
+        _tool_response("r1", _canned_review(verdict="needs_more_probing", reasoning="nothing has worked yet")),
+    ])
+    result = run_bootstrap_probe_loop(client, "http://test", _initial_schema(), max_probes=1, transport=_transport_always(400))
+
+    assert result.status == "failed"
+    assert result.notes == "nothing has worked yet"
+
+
+def test_failed_result_has_empty_notes_when_give_up_on_the_very_first_probe():
+    # No review ever ran, so there's genuinely nothing to report - empty
+    # notes here is correct, not a bug.
+    client = _FakeAnthropicClient([_tool_response("p1", _canned_probe(give_up=True))])
+    result = run_bootstrap_probe_loop(client, "http://test", _initial_schema(), max_probes=5, transport=_transport_always(200))
+
+    assert result.status == "failed"
+    assert result.notes == ""
+
+
+def test_raises_clear_error_when_initial_schema_has_no_endpoints():
+    empty_schema = DiscoveredSchema(status="not_found", fetched_from=None, endpoints=[])
+    client = _FakeAnthropicClient([])  # must never be called
+
+    with pytest.raises(ValueError, match="no endpoints"):
+        run_bootstrap_probe_loop(client, "http://test", empty_schema, max_probes=5, transport=_transport_always(200))
 
 
 def test_inconclusive_when_budget_exhausted_with_a_success_but_never_confident():
