@@ -33,3 +33,6 @@ venv/
 *.tmp
 *.bak
 *.zip
+
+# engine/ run output
+runs/
