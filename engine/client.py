@@ -3,12 +3,27 @@ used by every tool-forced call in the checkpoint loop. Identical logic
 existed in every prior experiment's run_live.py."""
 
 import os
+import time
 
+import anthropic
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_MAX_ATTEMPTS = 3
+
+# The SDK's own client already retries these internally (its own max_retries,
+# default a couple of attempts) before ever raising - if one of these still
+# reaches us, that budget is exhausted too. Worth another try at our level
+# with backoff, since a checkpoint call is expensive to have to restart from
+# scratch. Deliberately NOT retrying AuthenticationError/PermissionDeniedError/
+# BadRequestError/NotFoundError/etc. - those are permanent problems (bad key,
+# malformed request); retrying just burns time and attempt budget for nothing.
+_RETRYABLE_API_ERRORS = (
+    anthropic.APIConnectionError,  # covers APITimeoutError too (subclass)
+    anthropic.RateLimitError,
+    anthropic.InternalServerError,
+)
 
 
 def build_client() -> Anthropic:
@@ -25,19 +40,28 @@ def call_tool_with_retry(
     """Retries are informed, not blind repeats: on failure, the model's own malformed call and
     the concrete validation errors are fed back as a tool_result before asking again, so a
     systematic misunderstanding (e.g. an omitted required field) has a chance to self-correct
-    instead of reproducing the identical mistake on every attempt.
+    instead of reproducing the identical mistake on every attempt. Transient API errors (rate
+    limits, connection issues, 5xx) share the same attempt budget, retried with backoff rather
+    than fed back as a message, since there's no "correction" to make - just try again.
     """
     messages = [{"role": "user", "content": user_message}]
     last_errors = ["no attempts made"]
     for attempt in range(1, max_attempts + 1):
-        message = client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            system=system,
-            tools=tools,
-            tool_choice={"type": "tool", "name": tool_name},
-            messages=messages,
-        )
+        try:
+            message = client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=system,
+                tools=tools,
+                tool_choice={"type": "tool", "name": tool_name},
+                messages=messages,
+            )
+        except _RETRYABLE_API_ERRORS as e:
+            last_errors = [f"transient API error ({type(e).__name__}): {e}"]
+            print(f"  attempt {attempt} hit {last_errors[0]} - retrying")
+            if attempt < max_attempts:
+                time.sleep(min(2 ** (attempt - 1), 30))
+            continue
 
         tool_use = next((block for block in message.content if block.type == "tool_use"), None)
         if tool_use is None:
