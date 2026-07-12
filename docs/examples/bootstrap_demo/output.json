@@ -1,0 +1,1156 @@
+{
+  "api_schema": "POST /purchase\n\nRequest body:\n  auth_token: string - required - Authentication token required for the purchase. Must be a valid token recognized by the server. Several common values (test-auth-token-abc123, secret, admin) all returned 'invalid_auth_token' decline reason. Valid value not yet discovered.\n  card_number: string - required - Credit/debit card number as a string. Value '4111111111111111' (Visa test number) was accepted at the Pydantic level without a validation error. No format constraints confirmed beyond being a string.\n  expiry_month: integer - required - Card expiry month as an integer. Values 0, 12, and 13 all passed Pydantic validation without a 422 (only the missing auth_token triggered 422). This suggests no min/max Pydantic-level constraint confirmed yet \u2014 range 1-12 is suspected but unconfirmed.\n  expiry_year: integer - required - Card expiry year as an integer. Value 2026 used in all probes. No constraints observed.\n  cvv: string - required - Card CVV/security code as a string. Value '123' used in all probes without triggering Pydantic validation errors. No length or format constraints confirmed.\n  credit_count: integer - required - Number of credits to purchase as an integer. Negative values (e.g., -1) and positive values (1, 5, 10) all passed Pydantic validation. No min/max constraint confirmed at the Pydantic level.\n\nThis schema was discovered/confirmed by the adapter-bootstrap tool, not hand-written - review it before trusting it fully.",
+  "onboarding_extra": {},
+  "happy_day_example": {
+    "request": {
+      "method": "POST",
+      "path": "/purchase",
+      "body": {}
+    },
+    "response": {
+      "status": 422,
+      "body": {
+        "detail": [
+          {
+            "type": "missing",
+            "loc": [
+              "body",
+              "auth_token"
+            ],
+            "msg": "Field required",
+            "input": {}
+          },
+          {
+            "type": "missing",
+            "loc": [
+              "body",
+              "card_number"
+            ],
+            "msg": "Field required",
+            "input": {}
+          },
+          {
+            "type": "missing",
+            "loc": [
+              "body",
+              "expiry_month"
+            ],
+            "msg": "Field required",
+            "input": {}
+          },
+          {
+            "type": "missing",
+            "loc": [
+              "body",
+              "expiry_year"
+            ],
+            "msg": "Field required",
+            "input": {}
+          },
+          {
+            "type": "missing",
+            "loc": [
+              "body",
+              "cvv"
+            ],
+            "msg": "Field required",
+            "input": {}
+          },
+          {
+            "type": "missing",
+            "loc": [
+              "body",
+              "credit_count"
+            ],
+            "msg": "Field required",
+            "input": {}
+          }
+        ]
+      }
+    }
+  },
+  "casting_log": [
+    {
+      "checkpoint": 1,
+      "round": 1,
+      "round_reasoning": "\nLet me think through common bug classes for this endpoint:\n\n1. **Validation ordering / information leakage**: If the server validates card details before checking the auth_token, it might reveal card-related errors to unauthenticated users. This is a security bug.\n\n2. **Boundary values for credit_count**: \n   - credit_count = 0 (zero credits \u2014 is this allowed?)\n   - credit_count = negative (e.g., -1) \u2014 passed Pydantic but business logic may/may not catch it\n   - Very large values (integer overflow?)\n\n3. **Expiry month boundaries**: 0 and 13 passed Pydantic \u2014 does business logic reject them? What about month=1 vs 0?\n\n4. **Expired card**: expiry_year in the past (e.g., 2020) \u2014 does the server catch this?\n\n5. **Auth token discovery**: Try common tokens like \"token\", \"Bearer token\", \"password\", \"1234\", \"purchase-token\", etc.\n\n6. **Card number validation**: Empty string, obviously invalid card numbers, very long card numbers.\n\n7. **CVV edge cases**: Empty string, non-numeric CVV, very long CVV.\n\n8. **Type coercion**: What if credit_count is sent as a float string? Pydantic might coerce \"1.5\" \u2192 1 or reject it.\n\n9. **expiry_year in the past**: Server-side validation for expired cards.\n\n10. **Zero/negative credit_count with valid auth**: Would a negative credit_count cause a credit (refund)?\n\nLet me design a batch of 12 tests:\n\n- Test 1: Hypothesis \u2014 validation ordering leaks info. Send invalid auth but unusual card data (empty card_number) to see if card error appears before auth error.\n- Test 2: Hypothesis \u2014 credit_count=0 might be accepted (off-by-one).\n- Test 3: Hypothesis \u2014 negative credit_count passes all validation and processes as a refund/credit.\n- Test 4: Hypothesis \u2014 expired card (past year) is caught by business logic.\n- Test 5: Hypothesis \u2014 expiry_month=0 is rejected by business logic even if Pydantic accepts it.\n- Test 6: Hypothesis \u2014 expiry_month=13 is rejected by business logic.\n- Test 7: Auth token probe \u2014 try \"token\" as auth_token.\n- Test 8: Auth token probe \u2014 try \"purchase\" as auth_token.\n- Test 9: Empty string card_number \u2014 does Pydantic or business logic reject it?\n- Test 10: Very large credit_count (e.g., 999999999) \u2014 any overflow or special behavior?\n- Test 11: Auth token probe \u2014 try \"Bearer test\" or similar.\n- Test 12: CVV as non-numeric string \u2014 does it matter?\n",
+      "linked_hypothesis": "Validation ordering bug: card/input validation runs before auth_token verification, leaking information about card fields to unauthenticated callers. If this bug exists, an invalid auth_token with an empty card_number might return a card-related error rather than an auth error.",
+      "test_number": 1,
+      "request": {
+        "method": "POST",
+        "path": "/purchase",
+        "body": {
+          "auth_token": "invalid-token",
+          "card_number": "",
+          "expiry_month": 12,
+          "expiry_year": 2026,
+          "cvv": "123",
+          "credit_count": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "declined",
+          "decline_reason": "invalid_auth_token",
+          "credits_purchased": 0,
+          "total_charged": 0.0,
+          "new_credit_balance": null,
+          "transaction_id": null
+        }
+      },
+      "predicted_outcome": "If validation ordering bug exists: 4xx with a card-related error. If auth is checked first: 4xx with invalid_auth_token decline reason.",
+      "predicted_status_family": "4xx",
+      "actual_status_family": "2xx",
+      "prediction_matched": false
+    },
+    {
+      "checkpoint": 1,
+      "round": 1,
+      "round_reasoning": "\nLet me think through common bug classes for this endpoint:\n\n1. **Validation ordering / information leakage**: If the server validates card details before checking the auth_token, it might reveal card-related errors to unauthenticated users. This is a security bug.\n\n2. **Boundary values for credit_count**: \n   - credit_count = 0 (zero credits \u2014 is this allowed?)\n   - credit_count = negative (e.g., -1) \u2014 passed Pydantic but business logic may/may not catch it\n   - Very large values (integer overflow?)\n\n3. **Expiry month boundaries**: 0 and 13 passed Pydantic \u2014 does business logic reject them? What about month=1 vs 0?\n\n4. **Expired card**: expiry_year in the past (e.g., 2020) \u2014 does the server catch this?\n\n5. **Auth token discovery**: Try common tokens like \"token\", \"Bearer token\", \"password\", \"1234\", \"purchase-token\", etc.\n\n6. **Card number validation**: Empty string, obviously invalid card numbers, very long card numbers.\n\n7. **CVV edge cases**: Empty string, non-numeric CVV, very long CVV.\n\n8. **Type coercion**: What if credit_count is sent as a float string? Pydantic might coerce \"1.5\" \u2192 1 or reject it.\n\n9. **expiry_year in the past**: Server-side validation for expired cards.\n\n10. **Zero/negative credit_count with valid auth**: Would a negative credit_count cause a credit (refund)?\n\nLet me design a batch of 12 tests:\n\n- Test 1: Hypothesis \u2014 validation ordering leaks info. Send invalid auth but unusual card data (empty card_number) to see if card error appears before auth error.\n- Test 2: Hypothesis \u2014 credit_count=0 might be accepted (off-by-one).\n- Test 3: Hypothesis \u2014 negative credit_count passes all validation and processes as a refund/credit.\n- Test 4: Hypothesis \u2014 expired card (past year) is caught by business logic.\n- Test 5: Hypothesis \u2014 expiry_month=0 is rejected by business logic even if Pydantic accepts it.\n- Test 6: Hypothesis \u2014 expiry_month=13 is rejected by business logic.\n- Test 7: Auth token probe \u2014 try \"token\" as auth_token.\n- Test 8: Auth token probe \u2014 try \"purchase\" as auth_token.\n- Test 9: Empty string card_number \u2014 does Pydantic or business logic reject it?\n- Test 10: Very large credit_count (e.g., 999999999) \u2014 any overflow or special behavior?\n- Test 11: Auth token probe \u2014 try \"Bearer test\" or similar.\n- Test 12: CVV as non-numeric string \u2014 does it matter?\n",
+      "linked_hypothesis": "credit_count=0 is an off-by-one boundary: the server may accept 0 credits (no business value) without rejecting it, or may have a bug where it processes a zero-value purchase.",
+      "test_number": 2,
+      "request": {
+        "method": "POST",
+        "path": "/purchase",
+        "body": {
+          "auth_token": "test-auth-token-abc123",
+          "card_number": "4111111111111111",
+          "expiry_month": 12,
+          "expiry_year": 2026,
+          "cvv": "123",
+          "credit_count": 0
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "declined",
+          "decline_reason": "invalid_auth_token",
+          "credits_purchased": 0,
+          "total_charged": 0.0,
+          "new_credit_balance": null,
+          "transaction_id": null
+        }
+      },
+      "predicted_outcome": "Likely 4xx with invalid_auth_token since auth is wrong; but if auth were valid, 0 might pass or fail business logic.",
+      "predicted_status_family": "4xx",
+      "actual_status_family": "2xx",
+      "prediction_matched": false
+    },
+    {
+      "checkpoint": 1,
+      "round": 1,
+      "round_reasoning": "\nLet me think through common bug classes for this endpoint:\n\n1. **Validation ordering / information leakage**: If the server validates card details before checking the auth_token, it might reveal card-related errors to unauthenticated users. This is a security bug.\n\n2. **Boundary values for credit_count**: \n   - credit_count = 0 (zero credits \u2014 is this allowed?)\n   - credit_count = negative (e.g., -1) \u2014 passed Pydantic but business logic may/may not catch it\n   - Very large values (integer overflow?)\n\n3. **Expiry month boundaries**: 0 and 13 passed Pydantic \u2014 does business logic reject them? What about month=1 vs 0?\n\n4. **Expired card**: expiry_year in the past (e.g., 2020) \u2014 does the server catch this?\n\n5. **Auth token discovery**: Try common tokens like \"token\", \"Bearer token\", \"password\", \"1234\", \"purchase-token\", etc.\n\n6. **Card number validation**: Empty string, obviously invalid card numbers, very long card numbers.\n\n7. **CVV edge cases**: Empty string, non-numeric CVV, very long CVV.\n\n8. **Type coercion**: What if credit_count is sent as a float string? Pydantic might coerce \"1.5\" \u2192 1 or reject it.\n\n9. **expiry_year in the past**: Server-side validation for expired cards.\n\n10. **Zero/negative credit_count with valid auth**: Would a negative credit_count cause a credit (refund)?\n\nLet me design a batch of 12 tests:\n\n- Test 1: Hypothesis \u2014 validation ordering leaks info. Send invalid auth but unusual card data (empty card_number) to see if card error appears before auth error.\n- Test 2: Hypothesis \u2014 credit_count=0 might be accepted (off-by-one).\n- Test 3: Hypothesis \u2014 negative credit_count passes all validation and processes as a refund/credit.\n- Test 4: Hypothesis \u2014 expired card (past year) is caught by business logic.\n- Test 5: Hypothesis \u2014 expiry_month=0 is rejected by business logic even if Pydantic accepts it.\n- Test 6: Hypothesis \u2014 expiry_month=13 is rejected by business logic.\n- Test 7: Auth token probe \u2014 try \"token\" as auth_token.\n- Test 8: Auth token probe \u2014 try \"purchase\" as auth_token.\n- Test 9: Empty string card_number \u2014 does Pydantic or business logic reject it?\n- Test 10: Very large credit_count (e.g., 999999999) \u2014 any overflow or special behavior?\n- Test 11: Auth token probe \u2014 try \"Bearer test\" or similar.\n- Test 12: CVV as non-numeric string \u2014 does it matter?\n",
+      "linked_hypothesis": "Negative credit_count passes all validation layers and may be processed as a refund/credit operation \u2014 a serious business logic bug.",
+      "test_number": 3,
+      "request": {
+        "method": "POST",
+        "path": "/purchase",
+        "body": {
+          "auth_token": "test-auth-token-abc123",
+          "card_number": "4111111111111111",
+          "expiry_month": 12,
+          "expiry_year": 2026,
+          "cvv": "123",
+          "credit_count": -100
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "declined",
+          "decline_reason": "invalid_auth_token",
+          "credits_purchased": 0,
+          "total_charged": 0.0,
+          "new_credit_balance": null,
+          "transaction_id": null
+        }
+      },
+      "predicted_outcome": "4xx with invalid_auth_token (auth check first), but if auth were valid and no business logic guard, this could be a critical bug.",
+      "predicted_status_family": "4xx",
+      "actual_status_family": "2xx",
+      "prediction_matched": false
+    },
+    {
+      "checkpoint": 1,
+      "round": 1,
+      "round_reasoning": "\nLet me think through common bug classes for this endpoint:\n\n1. **Validation ordering / information leakage**: If the server validates card details before checking the auth_token, it might reveal card-related errors to unauthenticated users. This is a security bug.\n\n2. **Boundary values for credit_count**: \n   - credit_count = 0 (zero credits \u2014 is this allowed?)\n   - credit_count = negative (e.g., -1) \u2014 passed Pydantic but business logic may/may not catch it\n   - Very large values (integer overflow?)\n\n3. **Expiry month boundaries**: 0 and 13 passed Pydantic \u2014 does business logic reject them? What about month=1 vs 0?\n\n4. **Expired card**: expiry_year in the past (e.g., 2020) \u2014 does the server catch this?\n\n5. **Auth token discovery**: Try common tokens like \"token\", \"Bearer token\", \"password\", \"1234\", \"purchase-token\", etc.\n\n6. **Card number validation**: Empty string, obviously invalid card numbers, very long card numbers.\n\n7. **CVV edge cases**: Empty string, non-numeric CVV, very long CVV.\n\n8. **Type coercion**: What if credit_count is sent as a float string? Pydantic might coerce \"1.5\" \u2192 1 or reject it.\n\n9. **expiry_year in the past**: Server-side validation for expired cards.\n\n10. **Zero/negative credit_count with valid auth**: Would a negative credit_count cause a credit (refund)?\n\nLet me design a batch of 12 tests:\n\n- Test 1: Hypothesis \u2014 validation ordering leaks info. Send invalid auth but unusual card data (empty card_number) to see if card error appears before auth error.\n- Test 2: Hypothesis \u2014 credit_count=0 might be accepted (off-by-one).\n- Test 3: Hypothesis \u2014 negative credit_count passes all validation and processes as a refund/credit.\n- Test 4: Hypothesis \u2014 expired card (past year) is caught by business logic.\n- Test 5: Hypothesis \u2014 expiry_month=0 is rejected by business logic even if Pydantic accepts it.\n- Test 6: Hypothesis \u2014 expiry_month=13 is rejected by business logic.\n- Test 7: Auth token probe \u2014 try \"token\" as auth_token.\n- Test 8: Auth token probe \u2014 try \"purchase\" as auth_token.\n- Test 9: Empty string card_number \u2014 does Pydantic or business logic reject it?\n- Test 10: Very large credit_count (e.g., 999999999) \u2014 any overflow or special behavior?\n- Test 11: Auth token probe \u2014 try \"Bearer test\" or similar.\n- Test 12: CVV as non-numeric string \u2014 does it matter?\n",
+      "linked_hypothesis": "Expired card (past expiry_year) is caught by server-side business logic even if Pydantic doesn't enforce it. Server should return a decline for expired card.",
+      "test_number": 4,
+      "request": {
+        "method": "POST",
+        "path": "/purchase",
+        "body": {
+          "auth_token": "test-auth-token-abc123",
+          "card_number": "4111111111111111",
+          "expiry_month": 1,
+          "expiry_year": 2020,
+          "cvv": "123",
+          "credit_count": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "declined",
+          "decline_reason": "invalid_auth_token",
+          "credits_purchased": 0,
+          "total_charged": 0.0,
+          "new_credit_balance": null,
+          "transaction_id": null
+        }
+      },
+      "predicted_outcome": "4xx with invalid_auth_token (auth checked first), or if auth passes, an expired card decline.",
+      "predicted_status_family": "4xx",
+      "actual_status_family": "2xx",
+      "prediction_matched": false
+    },
+    {
+      "checkpoint": 1,
+      "round": 1,
+      "round_reasoning": "\nLet me think through common bug classes for this endpoint:\n\n1. **Validation ordering / information leakage**: If the server validates card details before checking the auth_token, it might reveal card-related errors to unauthenticated users. This is a security bug.\n\n2. **Boundary values for credit_count**: \n   - credit_count = 0 (zero credits \u2014 is this allowed?)\n   - credit_count = negative (e.g., -1) \u2014 passed Pydantic but business logic may/may not catch it\n   - Very large values (integer overflow?)\n\n3. **Expiry month boundaries**: 0 and 13 passed Pydantic \u2014 does business logic reject them? What about month=1 vs 0?\n\n4. **Expired card**: expiry_year in the past (e.g., 2020) \u2014 does the server catch this?\n\n5. **Auth token discovery**: Try common tokens like \"token\", \"Bearer token\", \"password\", \"1234\", \"purchase-token\", etc.\n\n6. **Card number validation**: Empty string, obviously invalid card numbers, very long card numbers.\n\n7. **CVV edge cases**: Empty string, non-numeric CVV, very long CVV.\n\n8. **Type coercion**: What if credit_count is sent as a float string? Pydantic might coerce \"1.5\" \u2192 1 or reject it.\n\n9. **expiry_year in the past**: Server-side validation for expired cards.\n\n10. **Zero/negative credit_count with valid auth**: Would a negative credit_count cause a credit (refund)?\n\nLet me design a batch of 12 tests:\n\n- Test 1: Hypothesis \u2014 validation ordering leaks info. Send invalid auth but unusual card data (empty card_number) to see if card error appears before auth error.\n- Test 2: Hypothesis \u2014 credit_count=0 might be accepted (off-by-one).\n- Test 3: Hypothesis \u2014 negative credit_count passes all validation and processes as a refund/credit.\n- Test 4: Hypothesis \u2014 expired card (past year) is caught by business logic.\n- Test 5: Hypothesis \u2014 expiry_month=0 is rejected by business logic even if Pydantic accepts it.\n- Test 6: Hypothesis \u2014 expiry_month=13 is rejected by business logic.\n- Test 7: Auth token probe \u2014 try \"token\" as auth_token.\n- Test 8: Auth token probe \u2014 try \"purchase\" as auth_token.\n- Test 9: Empty string card_number \u2014 does Pydantic or business logic reject it?\n- Test 10: Very large credit_count (e.g., 999999999) \u2014 any overflow or special behavior?\n- Test 11: Auth token probe \u2014 try \"Bearer test\" or similar.\n- Test 12: CVV as non-numeric string \u2014 does it matter?\n",
+      "linked_hypothesis": "expiry_month=0 passes Pydantic validation but should be caught by business logic as invalid month. If not caught, this is a validation gap bug.",
+      "test_number": 5,
+      "request": {
+        "method": "POST",
+        "path": "/purchase",
+        "body": {
+          "auth_token": "test-auth-token-abc123",
+          "card_number": "4111111111111111",
+          "expiry_month": 0,
+          "expiry_year": 2026,
+          "cvv": "123",
+          "credit_count": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "declined",
+          "decline_reason": "invalid_auth_token",
+          "credits_purchased": 0,
+          "total_charged": 0.0,
+          "new_credit_balance": null,
+          "transaction_id": null
+        }
+      },
+      "predicted_outcome": "4xx with invalid_auth_token (if auth checked first) or a month validation error. If neither, a bug exists.",
+      "predicted_status_family": "4xx",
+      "actual_status_family": "2xx",
+      "prediction_matched": false
+    },
+    {
+      "checkpoint": 1,
+      "round": 1,
+      "round_reasoning": "\nLet me think through common bug classes for this endpoint:\n\n1. **Validation ordering / information leakage**: If the server validates card details before checking the auth_token, it might reveal card-related errors to unauthenticated users. This is a security bug.\n\n2. **Boundary values for credit_count**: \n   - credit_count = 0 (zero credits \u2014 is this allowed?)\n   - credit_count = negative (e.g., -1) \u2014 passed Pydantic but business logic may/may not catch it\n   - Very large values (integer overflow?)\n\n3. **Expiry month boundaries**: 0 and 13 passed Pydantic \u2014 does business logic reject them? What about month=1 vs 0?\n\n4. **Expired card**: expiry_year in the past (e.g., 2020) \u2014 does the server catch this?\n\n5. **Auth token discovery**: Try common tokens like \"token\", \"Bearer token\", \"password\", \"1234\", \"purchase-token\", etc.\n\n6. **Card number validation**: Empty string, obviously invalid card numbers, very long card numbers.\n\n7. **CVV edge cases**: Empty string, non-numeric CVV, very long CVV.\n\n8. **Type coercion**: What if credit_count is sent as a float string? Pydantic might coerce \"1.5\" \u2192 1 or reject it.\n\n9. **expiry_year in the past**: Server-side validation for expired cards.\n\n10. **Zero/negative credit_count with valid auth**: Would a negative credit_count cause a credit (refund)?\n\nLet me design a batch of 12 tests:\n\n- Test 1: Hypothesis \u2014 validation ordering leaks info. Send invalid auth but unusual card data (empty card_number) to see if card error appears before auth error.\n- Test 2: Hypothesis \u2014 credit_count=0 might be accepted (off-by-one).\n- Test 3: Hypothesis \u2014 negative credit_count passes all validation and processes as a refund/credit.\n- Test 4: Hypothesis \u2014 expired card (past year) is caught by business logic.\n- Test 5: Hypothesis \u2014 expiry_month=0 is rejected by business logic even if Pydantic accepts it.\n- Test 6: Hypothesis \u2014 expiry_month=13 is rejected by business logic.\n- Test 7: Auth token probe \u2014 try \"token\" as auth_token.\n- Test 8: Auth token probe \u2014 try \"purchase\" as auth_token.\n- Test 9: Empty string card_number \u2014 does Pydantic or business logic reject it?\n- Test 10: Very large credit_count (e.g., 999999999) \u2014 any overflow or special behavior?\n- Test 11: Auth token probe \u2014 try \"Bearer test\" or similar.\n- Test 12: CVV as non-numeric string \u2014 does it matter?\n",
+      "linked_hypothesis": "expiry_month=13 passes Pydantic validation but should be caught by business logic as invalid month. If not caught, this is a validation gap bug.",
+      "test_number": 6,
+      "request": {
+        "method": "POST",
+        "path": "/purchase",
+        "body": {
+          "auth_token": "test-auth-token-abc123",
+          "card_number": "4111111111111111",
+          "expiry_month": 13,
+          "expiry_year": 2026,
+          "cvv": "123",
+          "credit_count": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "declined",
+          "decline_reason": "invalid_auth_token",
+          "credits_purchased": 0,
+          "total_charged": 0.0,
+          "new_credit_balance": null,
+          "transaction_id": null
+        }
+      },
+      "predicted_outcome": "4xx with invalid_auth_token (if auth checked first) or a month validation error.",
+      "predicted_status_family": "4xx",
+      "actual_status_family": "2xx",
+      "prediction_matched": false
+    },
+    {
+      "checkpoint": 1,
+      "round": 1,
+      "round_reasoning": "\nLet me think through common bug classes for this endpoint:\n\n1. **Validation ordering / information leakage**: If the server validates card details before checking the auth_token, it might reveal card-related errors to unauthenticated users. This is a security bug.\n\n2. **Boundary values for credit_count**: \n   - credit_count = 0 (zero credits \u2014 is this allowed?)\n   - credit_count = negative (e.g., -1) \u2014 passed Pydantic but business logic may/may not catch it\n   - Very large values (integer overflow?)\n\n3. **Expiry month boundaries**: 0 and 13 passed Pydantic \u2014 does business logic reject them? What about month=1 vs 0?\n\n4. **Expired card**: expiry_year in the past (e.g., 2020) \u2014 does the server catch this?\n\n5. **Auth token discovery**: Try common tokens like \"token\", \"Bearer token\", \"password\", \"1234\", \"purchase-token\", etc.\n\n6. **Card number validation**: Empty string, obviously invalid card numbers, very long card numbers.\n\n7. **CVV edge cases**: Empty string, non-numeric CVV, very long CVV.\n\n8. **Type coercion**: What if credit_count is sent as a float string? Pydantic might coerce \"1.5\" \u2192 1 or reject it.\n\n9. **expiry_year in the past**: Server-side validation for expired cards.\n\n10. **Zero/negative credit_count with valid auth**: Would a negative credit_count cause a credit (refund)?\n\nLet me design a batch of 12 tests:\n\n- Test 1: Hypothesis \u2014 validation ordering leaks info. Send invalid auth but unusual card data (empty card_number) to see if card error appears before auth error.\n- Test 2: Hypothesis \u2014 credit_count=0 might be accepted (off-by-one).\n- Test 3: Hypothesis \u2014 negative credit_count passes all validation and processes as a refund/credit.\n- Test 4: Hypothesis \u2014 expired card (past year) is caught by business logic.\n- Test 5: Hypothesis \u2014 expiry_month=0 is rejected by business logic even if Pydantic accepts it.\n- Test 6: Hypothesis \u2014 expiry_month=13 is rejected by business logic.\n- Test 7: Auth token probe \u2014 try \"token\" as auth_token.\n- Test 8: Auth token probe \u2014 try \"purchase\" as auth_token.\n- Test 9: Empty string card_number \u2014 does Pydantic or business logic reject it?\n- Test 10: Very large credit_count (e.g., 999999999) \u2014 any overflow or special behavior?\n- Test 11: Auth token probe \u2014 try \"Bearer test\" or similar.\n- Test 12: CVV as non-numeric string \u2014 does it matter?\n",
+      "linked_hypothesis": "Auth token 'token' might be a valid token \u2014 probing common simple values.",
+      "test_number": 7,
+      "request": {
+        "method": "POST",
+        "path": "/purchase",
+        "body": {
+          "auth_token": "token",
+          "card_number": "4111111111111111",
+          "expiry_month": 12,
+          "expiry_year": 2026,
+          "cvv": "123",
+          "credit_count": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "declined",
+          "decline_reason": "invalid_auth_token",
+          "credits_purchased": 0,
+          "total_charged": 0.0,
+          "new_credit_balance": null,
+          "transaction_id": null
+        }
+      },
+      "predicted_outcome": "4xx with invalid_auth_token decline reason.",
+      "predicted_status_family": "4xx",
+      "actual_status_family": "2xx",
+      "prediction_matched": false
+    },
+    {
+      "checkpoint": 1,
+      "round": 1,
+      "round_reasoning": "\nLet me think through common bug classes for this endpoint:\n\n1. **Validation ordering / information leakage**: If the server validates card details before checking the auth_token, it might reveal card-related errors to unauthenticated users. This is a security bug.\n\n2. **Boundary values for credit_count**: \n   - credit_count = 0 (zero credits \u2014 is this allowed?)\n   - credit_count = negative (e.g., -1) \u2014 passed Pydantic but business logic may/may not catch it\n   - Very large values (integer overflow?)\n\n3. **Expiry month boundaries**: 0 and 13 passed Pydantic \u2014 does business logic reject them? What about month=1 vs 0?\n\n4. **Expired card**: expiry_year in the past (e.g., 2020) \u2014 does the server catch this?\n\n5. **Auth token discovery**: Try common tokens like \"token\", \"Bearer token\", \"password\", \"1234\", \"purchase-token\", etc.\n\n6. **Card number validation**: Empty string, obviously invalid card numbers, very long card numbers.\n\n7. **CVV edge cases**: Empty string, non-numeric CVV, very long CVV.\n\n8. **Type coercion**: What if credit_count is sent as a float string? Pydantic might coerce \"1.5\" \u2192 1 or reject it.\n\n9. **expiry_year in the past**: Server-side validation for expired cards.\n\n10. **Zero/negative credit_count with valid auth**: Would a negative credit_count cause a credit (refund)?\n\nLet me design a batch of 12 tests:\n\n- Test 1: Hypothesis \u2014 validation ordering leaks info. Send invalid auth but unusual card data (empty card_number) to see if card error appears before auth error.\n- Test 2: Hypothesis \u2014 credit_count=0 might be accepted (off-by-one).\n- Test 3: Hypothesis \u2014 negative credit_count passes all validation and processes as a refund/credit.\n- Test 4: Hypothesis \u2014 expired card (past year) is caught by business logic.\n- Test 5: Hypothesis \u2014 expiry_month=0 is rejected by business logic even if Pydantic accepts it.\n- Test 6: Hypothesis \u2014 expiry_month=13 is rejected by business logic.\n- Test 7: Auth token probe \u2014 try \"token\" as auth_token.\n- Test 8: Auth token probe \u2014 try \"purchase\" as auth_token.\n- Test 9: Empty string card_number \u2014 does Pydantic or business logic reject it?\n- Test 10: Very large credit_count (e.g., 999999999) \u2014 any overflow or special behavior?\n- Test 11: Auth token probe \u2014 try \"Bearer test\" or similar.\n- Test 12: CVV as non-numeric string \u2014 does it matter?\n",
+      "linked_hypothesis": "Auth token 'purchase-token' might be a valid token \u2014 probing endpoint-specific naming conventions.",
+      "test_number": 8,
+      "request": {
+        "method": "POST",
+        "path": "/purchase",
+        "body": {
+          "auth_token": "purchase-token",
+          "card_number": "4111111111111111",
+          "expiry_month": 12,
+          "expiry_year": 2026,
+          "cvv": "123",
+          "credit_count": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "declined",
+          "decline_reason": "invalid_auth_token",
+          "credits_purchased": 0,
+          "total_charged": 0.0,
+          "new_credit_balance": null,
+          "transaction_id": null
+        }
+      },
+      "predicted_outcome": "4xx with invalid_auth_token decline reason.",
+      "predicted_status_family": "4xx",
+      "actual_status_family": "2xx",
+      "prediction_matched": false
+    },
+    {
+      "checkpoint": 1,
+      "round": 1,
+      "round_reasoning": "\nLet me think through common bug classes for this endpoint:\n\n1. **Validation ordering / information leakage**: If the server validates card details before checking the auth_token, it might reveal card-related errors to unauthenticated users. This is a security bug.\n\n2. **Boundary values for credit_count**: \n   - credit_count = 0 (zero credits \u2014 is this allowed?)\n   - credit_count = negative (e.g., -1) \u2014 passed Pydantic but business logic may/may not catch it\n   - Very large values (integer overflow?)\n\n3. **Expiry month boundaries**: 0 and 13 passed Pydantic \u2014 does business logic reject them? What about month=1 vs 0?\n\n4. **Expired card**: expiry_year in the past (e.g., 2020) \u2014 does the server catch this?\n\n5. **Auth token discovery**: Try common tokens like \"token\", \"Bearer token\", \"password\", \"1234\", \"purchase-token\", etc.\n\n6. **Card number validation**: Empty string, obviously invalid card numbers, very long card numbers.\n\n7. **CVV edge cases**: Empty string, non-numeric CVV, very long CVV.\n\n8. **Type coercion**: What if credit_count is sent as a float string? Pydantic might coerce \"1.5\" \u2192 1 or reject it.\n\n9. **expiry_year in the past**: Server-side validation for expired cards.\n\n10. **Zero/negative credit_count with valid auth**: Would a negative credit_count cause a credit (refund)?\n\nLet me design a batch of 12 tests:\n\n- Test 1: Hypothesis \u2014 validation ordering leaks info. Send invalid auth but unusual card data (empty card_number) to see if card error appears before auth error.\n- Test 2: Hypothesis \u2014 credit_count=0 might be accepted (off-by-one).\n- Test 3: Hypothesis \u2014 negative credit_count passes all validation and processes as a refund/credit.\n- Test 4: Hypothesis \u2014 expired card (past year) is caught by business logic.\n- Test 5: Hypothesis \u2014 expiry_month=0 is rejected by business logic even if Pydantic accepts it.\n- Test 6: Hypothesis \u2014 expiry_month=13 is rejected by business logic.\n- Test 7: Auth token probe \u2014 try \"token\" as auth_token.\n- Test 8: Auth token probe \u2014 try \"purchase\" as auth_token.\n- Test 9: Empty string card_number \u2014 does Pydantic or business logic reject it?\n- Test 10: Very large credit_count (e.g., 999999999) \u2014 any overflow or special behavior?\n- Test 11: Auth token probe \u2014 try \"Bearer test\" or similar.\n- Test 12: CVV as non-numeric string \u2014 does it matter?\n",
+      "linked_hypothesis": "Auth token 'password' or 'abc123' might be a valid default token.",
+      "test_number": 9,
+      "request": {
+        "method": "POST",
+        "path": "/purchase",
+        "body": {
+          "auth_token": "abc123",
+          "card_number": "4111111111111111",
+          "expiry_month": 12,
+          "expiry_year": 2026,
+          "cvv": "123",
+          "credit_count": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "declined",
+          "decline_reason": "invalid_auth_token",
+          "credits_purchased": 0,
+          "total_charged": 0.0,
+          "new_credit_balance": null,
+          "transaction_id": null
+        }
+      },
+      "predicted_outcome": "4xx with invalid_auth_token decline reason.",
+      "predicted_status_family": "4xx",
+      "actual_status_family": "2xx",
+      "prediction_matched": false
+    },
+    {
+      "checkpoint": 1,
+      "round": 1,
+      "round_reasoning": "\nLet me think through common bug classes for this endpoint:\n\n1. **Validation ordering / information leakage**: If the server validates card details before checking the auth_token, it might reveal card-related errors to unauthenticated users. This is a security bug.\n\n2. **Boundary values for credit_count**: \n   - credit_count = 0 (zero credits \u2014 is this allowed?)\n   - credit_count = negative (e.g., -1) \u2014 passed Pydantic but business logic may/may not catch it\n   - Very large values (integer overflow?)\n\n3. **Expiry month boundaries**: 0 and 13 passed Pydantic \u2014 does business logic reject them? What about month=1 vs 0?\n\n4. **Expired card**: expiry_year in the past (e.g., 2020) \u2014 does the server catch this?\n\n5. **Auth token discovery**: Try common tokens like \"token\", \"Bearer token\", \"password\", \"1234\", \"purchase-token\", etc.\n\n6. **Card number validation**: Empty string, obviously invalid card numbers, very long card numbers.\n\n7. **CVV edge cases**: Empty string, non-numeric CVV, very long CVV.\n\n8. **Type coercion**: What if credit_count is sent as a float string? Pydantic might coerce \"1.5\" \u2192 1 or reject it.\n\n9. **expiry_year in the past**: Server-side validation for expired cards.\n\n10. **Zero/negative credit_count with valid auth**: Would a negative credit_count cause a credit (refund)?\n\nLet me design a batch of 12 tests:\n\n- Test 1: Hypothesis \u2014 validation ordering leaks info. Send invalid auth but unusual card data (empty card_number) to see if card error appears before auth error.\n- Test 2: Hypothesis \u2014 credit_count=0 might be accepted (off-by-one).\n- Test 3: Hypothesis \u2014 negative credit_count passes all validation and processes as a refund/credit.\n- Test 4: Hypothesis \u2014 expired card (past year) is caught by business logic.\n- Test 5: Hypothesis \u2014 expiry_month=0 is rejected by business logic even if Pydantic accepts it.\n- Test 6: Hypothesis \u2014 expiry_month=13 is rejected by business logic.\n- Test 7: Auth token probe \u2014 try \"token\" as auth_token.\n- Test 8: Auth token probe \u2014 try \"purchase\" as auth_token.\n- Test 9: Empty string card_number \u2014 does Pydantic or business logic reject it?\n- Test 10: Very large credit_count (e.g., 999999999) \u2014 any overflow or special behavior?\n- Test 11: Auth token probe \u2014 try \"Bearer test\" or similar.\n- Test 12: CVV as non-numeric string \u2014 does it matter?\n",
+      "linked_hypothesis": "Very large credit_count could trigger integer overflow or unexpected behavior in pricing/business logic.",
+      "test_number": 10,
+      "request": {
+        "method": "POST",
+        "path": "/purchase",
+        "body": {
+          "auth_token": "test-auth-token-abc123",
+          "card_number": "4111111111111111",
+          "expiry_month": 12,
+          "expiry_year": 2026,
+          "cvv": "123",
+          "credit_count": 2147483647
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "declined",
+          "decline_reason": "invalid_auth_token",
+          "credits_purchased": 0,
+          "total_charged": 0.0,
+          "new_credit_balance": null,
+          "transaction_id": null
+        }
+      },
+      "predicted_outcome": "4xx with invalid_auth_token (auth fails first), but if auth were valid, overflow could cause issues.",
+      "predicted_status_family": "4xx",
+      "actual_status_family": "2xx",
+      "prediction_matched": false
+    },
+    {
+      "checkpoint": 1,
+      "round": 1,
+      "round_reasoning": "\nLet me think through common bug classes for this endpoint:\n\n1. **Validation ordering / information leakage**: If the server validates card details before checking the auth_token, it might reveal card-related errors to unauthenticated users. This is a security bug.\n\n2. **Boundary values for credit_count**: \n   - credit_count = 0 (zero credits \u2014 is this allowed?)\n   - credit_count = negative (e.g., -1) \u2014 passed Pydantic but business logic may/may not catch it\n   - Very large values (integer overflow?)\n\n3. **Expiry month boundaries**: 0 and 13 passed Pydantic \u2014 does business logic reject them? What about month=1 vs 0?\n\n4. **Expired card**: expiry_year in the past (e.g., 2020) \u2014 does the server catch this?\n\n5. **Auth token discovery**: Try common tokens like \"token\", \"Bearer token\", \"password\", \"1234\", \"purchase-token\", etc.\n\n6. **Card number validation**: Empty string, obviously invalid card numbers, very long card numbers.\n\n7. **CVV edge cases**: Empty string, non-numeric CVV, very long CVV.\n\n8. **Type coercion**: What if credit_count is sent as a float string? Pydantic might coerce \"1.5\" \u2192 1 or reject it.\n\n9. **expiry_year in the past**: Server-side validation for expired cards.\n\n10. **Zero/negative credit_count with valid auth**: Would a negative credit_count cause a credit (refund)?\n\nLet me design a batch of 12 tests:\n\n- Test 1: Hypothesis \u2014 validation ordering leaks info. Send invalid auth but unusual card data (empty card_number) to see if card error appears before auth error.\n- Test 2: Hypothesis \u2014 credit_count=0 might be accepted (off-by-one).\n- Test 3: Hypothesis \u2014 negative credit_count passes all validation and processes as a refund/credit.\n- Test 4: Hypothesis \u2014 expired card (past year) is caught by business logic.\n- Test 5: Hypothesis \u2014 expiry_month=0 is rejected by business logic even if Pydantic accepts it.\n- Test 6: Hypothesis \u2014 expiry_month=13 is rejected by business logic.\n- Test 7: Auth token probe \u2014 try \"token\" as auth_token.\n- Test 8: Auth token probe \u2014 try \"purchase\" as auth_token.\n- Test 9: Empty string card_number \u2014 does Pydantic or business logic reject it?\n- Test 10: Very large credit_count (e.g., 999999999) \u2014 any overflow or special behavior?\n- Test 11: Auth token probe \u2014 try \"Bearer test\" or similar.\n- Test 12: CVV as non-numeric string \u2014 does it matter?\n",
+      "linked_hypothesis": "Non-numeric CVV (letters/symbols) might not be validated by Pydantic (string type), but business logic should reject it. If it doesn't, that's a validation gap.",
+      "test_number": 11,
+      "request": {
+        "method": "POST",
+        "path": "/purchase",
+        "body": {
+          "auth_token": "test-auth-token-abc123",
+          "card_number": "4111111111111111",
+          "expiry_month": 12,
+          "expiry_year": 2026,
+          "cvv": "abc",
+          "credit_count": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "declined",
+          "decline_reason": "invalid_auth_token",
+          "credits_purchased": 0,
+          "total_charged": 0.0,
+          "new_credit_balance": null,
+          "transaction_id": null
+        }
+      },
+      "predicted_outcome": "4xx with invalid_auth_token (auth checked first), or CVV validation error if card is validated before auth.",
+      "predicted_status_family": "4xx",
+      "actual_status_family": "2xx",
+      "prediction_matched": false
+    },
+    {
+      "checkpoint": 1,
+      "round": 1,
+      "round_reasoning": "\nLet me think through common bug classes for this endpoint:\n\n1. **Validation ordering / information leakage**: If the server validates card details before checking the auth_token, it might reveal card-related errors to unauthenticated users. This is a security bug.\n\n2. **Boundary values for credit_count**: \n   - credit_count = 0 (zero credits \u2014 is this allowed?)\n   - credit_count = negative (e.g., -1) \u2014 passed Pydantic but business logic may/may not catch it\n   - Very large values (integer overflow?)\n\n3. **Expiry month boundaries**: 0 and 13 passed Pydantic \u2014 does business logic reject them? What about month=1 vs 0?\n\n4. **Expired card**: expiry_year in the past (e.g., 2020) \u2014 does the server catch this?\n\n5. **Auth token discovery**: Try common tokens like \"token\", \"Bearer token\", \"password\", \"1234\", \"purchase-token\", etc.\n\n6. **Card number validation**: Empty string, obviously invalid card numbers, very long card numbers.\n\n7. **CVV edge cases**: Empty string, non-numeric CVV, very long CVV.\n\n8. **Type coercion**: What if credit_count is sent as a float string? Pydantic might coerce \"1.5\" \u2192 1 or reject it.\n\n9. **expiry_year in the past**: Server-side validation for expired cards.\n\n10. **Zero/negative credit_count with valid auth**: Would a negative credit_count cause a credit (refund)?\n\nLet me design a batch of 12 tests:\n\n- Test 1: Hypothesis \u2014 validation ordering leaks info. Send invalid auth but unusual card data (empty card_number) to see if card error appears before auth error.\n- Test 2: Hypothesis \u2014 credit_count=0 might be accepted (off-by-one).\n- Test 3: Hypothesis \u2014 negative credit_count passes all validation and processes as a refund/credit.\n- Test 4: Hypothesis \u2014 expired card (past year) is caught by business logic.\n- Test 5: Hypothesis \u2014 expiry_month=0 is rejected by business logic even if Pydantic accepts it.\n- Test 6: Hypothesis \u2014 expiry_month=13 is rejected by business logic.\n- Test 7: Auth token probe \u2014 try \"token\" as auth_token.\n- Test 8: Auth token probe \u2014 try \"purchase\" as auth_token.\n- Test 9: Empty string card_number \u2014 does Pydantic or business logic reject it?\n- Test 10: Very large credit_count (e.g., 999999999) \u2014 any overflow or special behavior?\n- Test 11: Auth token probe \u2014 try \"Bearer test\" or similar.\n- Test 12: CVV as non-numeric string \u2014 does it matter?\n",
+      "linked_hypothesis": "",
+      "test_number": 12,
+      "request": {
+        "method": "POST",
+        "path": "/purchase",
+        "body": {
+          "auth_token": "supersecret",
+          "card_number": "4111111111111111",
+          "expiry_month": 12,
+          "expiry_year": 2026,
+          "cvv": "123",
+          "credit_count": 5
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "declined",
+          "decline_reason": "invalid_auth_token",
+          "credits_purchased": 0,
+          "total_charged": 0.0,
+          "new_credit_balance": null,
+          "transaction_id": null
+        }
+      },
+      "predicted_outcome": "Pure edge case: probing another common auth token value. Expecting 4xx with invalid_auth_token.",
+      "predicted_status_family": "4xx",
+      "actual_status_family": "2xx",
+      "prediction_matched": false
+    },
+    {
+      "checkpoint": 2,
+      "round": 1,
+      "round_reasoning": "Key learnings: All 12 prior tests hit the auth gate and returned 200 + declined + invalid_auth_token. The Skeptic correctly notes we haven't found a valid auth token and haven't tested any business logic. My priorities this round:\n\n1. **Find valid auth token** - Try many more candidates: empty string, \"test\", \"dev\", \"demo\", \"api_key\", \"letmein\", \"credits\", UUIDs, domain-specific values like \"credits-api-token\", \"buy-credits\", \"api-key-123\", etc.\n2. **Test auth_token in different transport** - Try passing token in Authorization header style via body with \"Bearer \" prefix\n3. **Test empty string auth_token** - Might bypass validation or match a stored empty token\n4. **Test whether auth check order can be bypassed** - e.g., null/missing in a different way\n\nI'll use 8 tests to probe as many auth token candidates as possible, since that's the single biggest blocker. I'll also try a couple edge cases around the auth_token field itself (empty string, whitespace-only).",
+      "linked_hypothesis": "Auth token might be an empty string - some systems allow empty/null tokens or have a bug where empty string bypasses validation.",
+      "test_number": 13,
+      "request": {
+        "method": "POST",
+        "path": "/purchase",
+        "body": {
+          "auth_token": "",
+          "card_number": "4111111111111111",
+          "expiry_month": 12,
+          "expiry_year": 2026,
+          "cvv": "123",
+          "credit_count": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "declined",
+          "decline_reason": "invalid_auth_token",
+          "credits_purchased": 0,
+          "total_charged": 0.0,
+          "new_credit_balance": null,
+          "transaction_id": null
+        }
+      },
+      "predicted_outcome": "Either 200+declined+invalid_auth_token (empty string treated as invalid), or possibly a different response if empty string is a special case.",
+      "predicted_status_family": "2xx",
+      "actual_status_family": "2xx",
+      "prediction_matched": true
+    },
+    {
+      "checkpoint": 2,
+      "round": 1,
+      "round_reasoning": "Key learnings: All 12 prior tests hit the auth gate and returned 200 + declined + invalid_auth_token. The Skeptic correctly notes we haven't found a valid auth token and haven't tested any business logic. My priorities this round:\n\n1. **Find valid auth token** - Try many more candidates: empty string, \"test\", \"dev\", \"demo\", \"api_key\", \"letmein\", \"credits\", UUIDs, domain-specific values like \"credits-api-token\", \"buy-credits\", \"api-key-123\", etc.\n2. **Test auth_token in different transport** - Try passing token in Authorization header style via body with \"Bearer \" prefix\n3. **Test empty string auth_token** - Might bypass validation or match a stored empty token\n4. **Test whether auth check order can be bypassed** - e.g., null/missing in a different way\n\nI'll use 8 tests to probe as many auth token candidates as possible, since that's the single biggest blocker. I'll also try a couple edge cases around the auth_token field itself (empty string, whitespace-only).",
+      "linked_hypothesis": "Auth token 'test' might be a valid minimal token - a common default in dev environments.",
+      "test_number": 14,
+      "request": {
+        "method": "POST",
+        "path": "/purchase",
+        "body": {
+          "auth_token": "test",
+          "card_number": "4111111111111111",
+          "expiry_month": 12,
+          "expiry_year": 2026,
+          "cvv": "123",
+          "credit_count": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "declined",
+          "decline_reason": "invalid_auth_token",
+          "credits_purchased": 0,
+          "total_charged": 0.0,
+          "new_credit_balance": null,
+          "transaction_id": null
+        }
+      },
+      "predicted_outcome": "200+declined+invalid_auth_token if wrong, or 200+approved if correct.",
+      "predicted_status_family": "2xx",
+      "actual_status_family": "2xx",
+      "prediction_matched": true
+    },
+    {
+      "checkpoint": 2,
+      "round": 1,
+      "round_reasoning": "Key learnings: All 12 prior tests hit the auth gate and returned 200 + declined + invalid_auth_token. The Skeptic correctly notes we haven't found a valid auth token and haven't tested any business logic. My priorities this round:\n\n1. **Find valid auth token** - Try many more candidates: empty string, \"test\", \"dev\", \"demo\", \"api_key\", \"letmein\", \"credits\", UUIDs, domain-specific values like \"credits-api-token\", \"buy-credits\", \"api-key-123\", etc.\n2. **Test auth_token in different transport** - Try passing token in Authorization header style via body with \"Bearer \" prefix\n3. **Test empty string auth_token** - Might bypass validation or match a stored empty token\n4. **Test whether auth check order can be bypassed** - e.g., null/missing in a different way\n\nI'll use 8 tests to probe as many auth token candidates as possible, since that's the single biggest blocker. I'll also try a couple edge cases around the auth_token field itself (empty string, whitespace-only).",
+      "linked_hypothesis": "Auth token 'dev' or 'demo' might be a valid token in a development/demo environment.",
+      "test_number": 15,
+      "request": {
+        "method": "POST",
+        "path": "/purchase",
+        "body": {
+          "auth_token": "dev",
+          "card_number": "4111111111111111",
+          "expiry_month": 12,
+          "expiry_year": 2026,
+          "cvv": "123",
+          "credit_count": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "declined",
+          "decline_reason": "invalid_auth_token",
+          "credits_purchased": 0,
+          "total_charged": 0.0,
+          "new_credit_balance": null,
+          "transaction_id": null
+        }
+      },
+      "predicted_outcome": "200+declined+invalid_auth_token if wrong.",
+      "predicted_status_family": "2xx",
+      "actual_status_family": "2xx",
+      "prediction_matched": true
+    },
+    {
+      "checkpoint": 2,
+      "round": 1,
+      "round_reasoning": "Key learnings: All 12 prior tests hit the auth gate and returned 200 + declined + invalid_auth_token. The Skeptic correctly notes we haven't found a valid auth token and haven't tested any business logic. My priorities this round:\n\n1. **Find valid auth token** - Try many more candidates: empty string, \"test\", \"dev\", \"demo\", \"api_key\", \"letmein\", \"credits\", UUIDs, domain-specific values like \"credits-api-token\", \"buy-credits\", \"api-key-123\", etc.\n2. **Test auth_token in different transport** - Try passing token in Authorization header style via body with \"Bearer \" prefix\n3. **Test empty string auth_token** - Might bypass validation or match a stored empty token\n4. **Test whether auth check order can be bypassed** - e.g., null/missing in a different way\n\nI'll use 8 tests to probe as many auth token candidates as possible, since that's the single biggest blocker. I'll also try a couple edge cases around the auth_token field itself (empty string, whitespace-only).",
+      "linked_hypothesis": "Auth token 'demo' might be a valid token in a demo/test environment.",
+      "test_number": 16,
+      "request": {
+        "method": "POST",
+        "path": "/purchase",
+        "body": {
+          "auth_token": "demo",
+          "card_number": "4111111111111111",
+          "expiry_month": 12,
+          "expiry_year": 2026,
+          "cvv": "123",
+          "credit_count": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "declined",
+          "decline_reason": "invalid_auth_token",
+          "credits_purchased": 0,
+          "total_charged": 0.0,
+          "new_credit_balance": null,
+          "transaction_id": null
+        }
+      },
+      "predicted_outcome": "200+declined+invalid_auth_token if wrong.",
+      "predicted_status_family": "2xx",
+      "actual_status_family": "2xx",
+      "prediction_matched": true
+    },
+    {
+      "checkpoint": 2,
+      "round": 1,
+      "round_reasoning": "Key learnings: All 12 prior tests hit the auth gate and returned 200 + declined + invalid_auth_token. The Skeptic correctly notes we haven't found a valid auth token and haven't tested any business logic. My priorities this round:\n\n1. **Find valid auth token** - Try many more candidates: empty string, \"test\", \"dev\", \"demo\", \"api_key\", \"letmein\", \"credits\", UUIDs, domain-specific values like \"credits-api-token\", \"buy-credits\", \"api-key-123\", etc.\n2. **Test auth_token in different transport** - Try passing token in Authorization header style via body with \"Bearer \" prefix\n3. **Test empty string auth_token** - Might bypass validation or match a stored empty token\n4. **Test whether auth check order can be bypassed** - e.g., null/missing in a different way\n\nI'll use 8 tests to probe as many auth token candidates as possible, since that's the single biggest blocker. I'll also try a couple edge cases around the auth_token field itself (empty string, whitespace-only).",
+      "linked_hypothesis": "Auth token might be a well-known UUID like all-zeros, which some systems use as a default/test token.",
+      "test_number": 17,
+      "request": {
+        "method": "POST",
+        "path": "/purchase",
+        "body": {
+          "auth_token": "00000000-0000-0000-0000-000000000000",
+          "card_number": "4111111111111111",
+          "expiry_month": 12,
+          "expiry_year": 2026,
+          "cvv": "123",
+          "credit_count": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "declined",
+          "decline_reason": "invalid_auth_token",
+          "credits_purchased": 0,
+          "total_charged": 0.0,
+          "new_credit_balance": null,
+          "transaction_id": null
+        }
+      },
+      "predicted_outcome": "200+declined+invalid_auth_token if wrong.",
+      "predicted_status_family": "2xx",
+      "actual_status_family": "2xx",
+      "prediction_matched": true
+    },
+    {
+      "checkpoint": 2,
+      "round": 1,
+      "round_reasoning": "Key learnings: All 12 prior tests hit the auth gate and returned 200 + declined + invalid_auth_token. The Skeptic correctly notes we haven't found a valid auth token and haven't tested any business logic. My priorities this round:\n\n1. **Find valid auth token** - Try many more candidates: empty string, \"test\", \"dev\", \"demo\", \"api_key\", \"letmein\", \"credits\", UUIDs, domain-specific values like \"credits-api-token\", \"buy-credits\", \"api-key-123\", etc.\n2. **Test auth_token in different transport** - Try passing token in Authorization header style via body with \"Bearer \" prefix\n3. **Test empty string auth_token** - Might bypass validation or match a stored empty token\n4. **Test whether auth check order can be bypassed** - e.g., null/missing in a different way\n\nI'll use 8 tests to probe as many auth token candidates as possible, since that's the single biggest blocker. I'll also try a couple edge cases around the auth_token field itself (empty string, whitespace-only).",
+      "linked_hypothesis": "Auth token 'api_key' or 'apikey' might be a valid default token name used as value in test environments.",
+      "test_number": 18,
+      "request": {
+        "method": "POST",
+        "path": "/purchase",
+        "body": {
+          "auth_token": "apikey",
+          "card_number": "4111111111111111",
+          "expiry_month": 12,
+          "expiry_year": 2026,
+          "cvv": "123",
+          "credit_count": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "declined",
+          "decline_reason": "invalid_auth_token",
+          "credits_purchased": 0,
+          "total_charged": 0.0,
+          "new_credit_balance": null,
+          "transaction_id": null
+        }
+      },
+      "predicted_outcome": "200+declined+invalid_auth_token if wrong.",
+      "predicted_status_family": "2xx",
+      "actual_status_family": "2xx",
+      "prediction_matched": true
+    },
+    {
+      "checkpoint": 2,
+      "round": 1,
+      "round_reasoning": "Key learnings: All 12 prior tests hit the auth gate and returned 200 + declined + invalid_auth_token. The Skeptic correctly notes we haven't found a valid auth token and haven't tested any business logic. My priorities this round:\n\n1. **Find valid auth token** - Try many more candidates: empty string, \"test\", \"dev\", \"demo\", \"api_key\", \"letmein\", \"credits\", UUIDs, domain-specific values like \"credits-api-token\", \"buy-credits\", \"api-key-123\", etc.\n2. **Test auth_token in different transport** - Try passing token in Authorization header style via body with \"Bearer \" prefix\n3. **Test empty string auth_token** - Might bypass validation or match a stored empty token\n4. **Test whether auth check order can be bypassed** - e.g., null/missing in a different way\n\nI'll use 8 tests to probe as many auth token candidates as possible, since that's the single biggest blocker. I'll also try a couple edge cases around the auth_token field itself (empty string, whitespace-only).",
+      "linked_hypothesis": "Auth token 'letmein' is a classic default credential that might be used in test APIs.",
+      "test_number": 19,
+      "request": {
+        "method": "POST",
+        "path": "/purchase",
+        "body": {
+          "auth_token": "letmein",
+          "card_number": "4111111111111111",
+          "expiry_month": 12,
+          "expiry_year": 2026,
+          "cvv": "123",
+          "credit_count": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "declined",
+          "decline_reason": "invalid_auth_token",
+          "credits_purchased": 0,
+          "total_charged": 0.0,
+          "new_credit_balance": null,
+          "transaction_id": null
+        }
+      },
+      "predicted_outcome": "200+declined+invalid_auth_token if wrong.",
+      "predicted_status_family": "2xx",
+      "actual_status_family": "2xx",
+      "prediction_matched": true
+    },
+    {
+      "checkpoint": 2,
+      "round": 1,
+      "round_reasoning": "Key learnings: All 12 prior tests hit the auth gate and returned 200 + declined + invalid_auth_token. The Skeptic correctly notes we haven't found a valid auth token and haven't tested any business logic. My priorities this round:\n\n1. **Find valid auth token** - Try many more candidates: empty string, \"test\", \"dev\", \"demo\", \"api_key\", \"letmein\", \"credits\", UUIDs, domain-specific values like \"credits-api-token\", \"buy-credits\", \"api-key-123\", etc.\n2. **Test auth_token in different transport** - Try passing token in Authorization header style via body with \"Bearer \" prefix\n3. **Test empty string auth_token** - Might bypass validation or match a stored empty token\n4. **Test whether auth check order can be bypassed** - e.g., null/missing in a different way\n\nI'll use 8 tests to probe as many auth token candidates as possible, since that's the single biggest blocker. I'll also try a couple edge cases around the auth_token field itself (empty string, whitespace-only).",
+      "linked_hypothesis": "Auth token might follow a 'Bearer <value>' format even in the body field, or the value 'password' is a common default.",
+      "test_number": 20,
+      "request": {
+        "method": "POST",
+        "path": "/purchase",
+        "body": {
+          "auth_token": "password",
+          "card_number": "4111111111111111",
+          "expiry_month": 12,
+          "expiry_year": 2026,
+          "cvv": "123",
+          "credit_count": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "declined",
+          "decline_reason": "invalid_auth_token",
+          "credits_purchased": 0,
+          "total_charged": 0.0,
+          "new_credit_balance": null,
+          "transaction_id": null
+        }
+      },
+      "predicted_outcome": "200+declined+invalid_auth_token if wrong.",
+      "predicted_status_family": "2xx",
+      "actual_status_family": "2xx",
+      "prediction_matched": true
+    },
+    {
+      "checkpoint": 3,
+      "round": 1,
+      "round_reasoning": "Based on the Skeptic's review, I have two key action items:\n\n1. **Header-based auth delivery** - explicitly recommended twice and never tried. I'll test with various tokens in Authorization headers, X-API-Key, X-Auth-Token while using a dummy body auth_token or omitting it.\n\n2. **More domain-specific token candidates** in the body - 'credits', 'buy-credits', 'credit-purchase', 'purchase-credits', 'api-key-123', 'sk-test-123', 'test-key', 'auth-token', 'auth_token', numeric strings like '1234'.\n\n3. **Pydantic validation with semantically invalid but structurally present values** - card_number as 3 digits, etc. Though most of these have been tried (expiry_month=0,13; credit_count=-1; cvv='abc'), card_number as very short string hasn't been tried.\n\nI'll split 8 tests across:\n- 3 tests probing header-based auth (different header names + body structure variations)\n- 5 tests with new token candidates\n\nSince I can't set actual HTTP headers via this tool (only body fields), I'll focus the header-based tests by omitting auth_token from the body... but wait, auth_token is required by Pydantic, so omitting it returns 422. However, I can try setting auth_token to a plausible dummy in the body while the real intent would be to see if behavior changes. Actually, the tool only controls the body fields listed - there's no header parameter. So I can't directly test header-based auth via this tool.\n\nLet me instead focus on:\n1. New domain-specific token candidates (auth_token, credits, buy-credits, sk-test-123, 1234, 0000, purchase, api-key)\n2. Pydantic boundary: card_number as very short string \"123\" - tests whether card number format validation fires before auth check\n3. A SQL injection-style token to see if anything unusual happens\n\nLet me make 8 tests covering new token candidates and edge cases.",
+      "linked_hypothesis": "Auth token 'credits' matches the domain vocabulary of the API (purchasing credits) and might be a valid test token.",
+      "test_number": 21,
+      "request": {
+        "method": "POST",
+        "path": "/purchase",
+        "body": {
+          "auth_token": "credits",
+          "card_number": "4111111111111111",
+          "expiry_month": 12,
+          "expiry_year": 2026,
+          "cvv": "123",
+          "credit_count": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "declined",
+          "decline_reason": "invalid_auth_token",
+          "credits_purchased": 0,
+          "total_charged": 0.0,
+          "new_credit_balance": null,
+          "transaction_id": null
+        }
+      },
+      "predicted_outcome": "200+declined+invalid_auth_token if wrong, or 200+approved if this is the valid token.",
+      "predicted_status_family": "2xx",
+      "actual_status_family": "2xx",
+      "prediction_matched": true
+    },
+    {
+      "checkpoint": 3,
+      "round": 1,
+      "round_reasoning": "Based on the Skeptic's review, I have two key action items:\n\n1. **Header-based auth delivery** - explicitly recommended twice and never tried. I'll test with various tokens in Authorization headers, X-API-Key, X-Auth-Token while using a dummy body auth_token or omitting it.\n\n2. **More domain-specific token candidates** in the body - 'credits', 'buy-credits', 'credit-purchase', 'purchase-credits', 'api-key-123', 'sk-test-123', 'test-key', 'auth-token', 'auth_token', numeric strings like '1234'.\n\n3. **Pydantic validation with semantically invalid but structurally present values** - card_number as 3 digits, etc. Though most of these have been tried (expiry_month=0,13; credit_count=-1; cvv='abc'), card_number as very short string hasn't been tried.\n\nI'll split 8 tests across:\n- 3 tests probing header-based auth (different header names + body structure variations)\n- 5 tests with new token candidates\n\nSince I can't set actual HTTP headers via this tool (only body fields), I'll focus the header-based tests by omitting auth_token from the body... but wait, auth_token is required by Pydantic, so omitting it returns 422. However, I can try setting auth_token to a plausible dummy in the body while the real intent would be to see if behavior changes. Actually, the tool only controls the body fields listed - there's no header parameter. So I can't directly test header-based auth via this tool.\n\nLet me instead focus on:\n1. New domain-specific token candidates (auth_token, credits, buy-credits, sk-test-123, 1234, 0000, purchase, api-key)\n2. Pydantic boundary: card_number as very short string \"123\" - tests whether card number format validation fires before auth check\n3. A SQL injection-style token to see if anything unusual happens\n\nLet me make 8 tests covering new token candidates and edge cases.",
+      "linked_hypothesis": "Auth token 'auth-token' or 'auth_token' might be the valid token - matching the field name itself, a known anti-pattern in test APIs.",
+      "test_number": 22,
+      "request": {
+        "method": "POST",
+        "path": "/purchase",
+        "body": {
+          "auth_token": "auth_token",
+          "card_number": "4111111111111111",
+          "expiry_month": 12,
+          "expiry_year": 2026,
+          "cvv": "123",
+          "credit_count": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "declined",
+          "decline_reason": "invalid_auth_token",
+          "credits_purchased": 0,
+          "total_charged": 0.0,
+          "new_credit_balance": null,
+          "transaction_id": null
+        }
+      },
+      "predicted_outcome": "200+declined+invalid_auth_token if wrong, or 200+approved if this is the valid token.",
+      "predicted_status_family": "2xx",
+      "actual_status_family": "2xx",
+      "prediction_matched": true
+    },
+    {
+      "checkpoint": 3,
+      "round": 1,
+      "round_reasoning": "Based on the Skeptic's review, I have two key action items:\n\n1. **Header-based auth delivery** - explicitly recommended twice and never tried. I'll test with various tokens in Authorization headers, X-API-Key, X-Auth-Token while using a dummy body auth_token or omitting it.\n\n2. **More domain-specific token candidates** in the body - 'credits', 'buy-credits', 'credit-purchase', 'purchase-credits', 'api-key-123', 'sk-test-123', 'test-key', 'auth-token', 'auth_token', numeric strings like '1234'.\n\n3. **Pydantic validation with semantically invalid but structurally present values** - card_number as 3 digits, etc. Though most of these have been tried (expiry_month=0,13; credit_count=-1; cvv='abc'), card_number as very short string hasn't been tried.\n\nI'll split 8 tests across:\n- 3 tests probing header-based auth (different header names + body structure variations)\n- 5 tests with new token candidates\n\nSince I can't set actual HTTP headers via this tool (only body fields), I'll focus the header-based tests by omitting auth_token from the body... but wait, auth_token is required by Pydantic, so omitting it returns 422. However, I can try setting auth_token to a plausible dummy in the body while the real intent would be to see if behavior changes. Actually, the tool only controls the body fields listed - there's no header parameter. So I can't directly test header-based auth via this tool.\n\nLet me instead focus on:\n1. New domain-specific token candidates (auth_token, credits, buy-credits, sk-test-123, 1234, 0000, purchase, api-key)\n2. Pydantic boundary: card_number as very short string \"123\" - tests whether card number format validation fires before auth check\n3. A SQL injection-style token to see if anything unusual happens\n\nLet me make 8 tests covering new token candidates and edge cases.",
+      "linked_hypothesis": "Auth token 'purchase' matches the endpoint name and might be used as a test token in development.",
+      "test_number": 23,
+      "request": {
+        "method": "POST",
+        "path": "/purchase",
+        "body": {
+          "auth_token": "purchase",
+          "card_number": "4111111111111111",
+          "expiry_month": 12,
+          "expiry_year": 2026,
+          "cvv": "123",
+          "credit_count": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "declined",
+          "decline_reason": "invalid_auth_token",
+          "credits_purchased": 0,
+          "total_charged": 0.0,
+          "new_credit_balance": null,
+          "transaction_id": null
+        }
+      },
+      "predicted_outcome": "200+declined+invalid_auth_token if wrong, or 200+approved if this is the valid token.",
+      "predicted_status_family": "2xx",
+      "actual_status_family": "2xx",
+      "prediction_matched": true
+    },
+    {
+      "checkpoint": 3,
+      "round": 1,
+      "round_reasoning": "Based on the Skeptic's review, I have two key action items:\n\n1. **Header-based auth delivery** - explicitly recommended twice and never tried. I'll test with various tokens in Authorization headers, X-API-Key, X-Auth-Token while using a dummy body auth_token or omitting it.\n\n2. **More domain-specific token candidates** in the body - 'credits', 'buy-credits', 'credit-purchase', 'purchase-credits', 'api-key-123', 'sk-test-123', 'test-key', 'auth-token', 'auth_token', numeric strings like '1234'.\n\n3. **Pydantic validation with semantically invalid but structurally present values** - card_number as 3 digits, etc. Though most of these have been tried (expiry_month=0,13; credit_count=-1; cvv='abc'), card_number as very short string hasn't been tried.\n\nI'll split 8 tests across:\n- 3 tests probing header-based auth (different header names + body structure variations)\n- 5 tests with new token candidates\n\nSince I can't set actual HTTP headers via this tool (only body fields), I'll focus the header-based tests by omitting auth_token from the body... but wait, auth_token is required by Pydantic, so omitting it returns 422. However, I can try setting auth_token to a plausible dummy in the body while the real intent would be to see if behavior changes. Actually, the tool only controls the body fields listed - there's no header parameter. So I can't directly test header-based auth via this tool.\n\nLet me instead focus on:\n1. New domain-specific token candidates (auth_token, credits, buy-credits, sk-test-123, 1234, 0000, purchase, api-key)\n2. Pydantic boundary: card_number as very short string \"123\" - tests whether card number format validation fires before auth check\n3. A SQL injection-style token to see if anything unusual happens\n\nLet me make 8 tests covering new token candidates and edge cases.",
+      "linked_hypothesis": "Auth token 'sk-test-123' follows Stripe-like API key conventions which some test payment APIs emulate.",
+      "test_number": 24,
+      "request": {
+        "method": "POST",
+        "path": "/purchase",
+        "body": {
+          "auth_token": "sk-test-123",
+          "card_number": "4111111111111111",
+          "expiry_month": 12,
+          "expiry_year": 2026,
+          "cvv": "123",
+          "credit_count": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "declined",
+          "decline_reason": "invalid_auth_token",
+          "credits_purchased": 0,
+          "total_charged": 0.0,
+          "new_credit_balance": null,
+          "transaction_id": null
+        }
+      },
+      "predicted_outcome": "200+declined+invalid_auth_token if wrong.",
+      "predicted_status_family": "2xx",
+      "actual_status_family": "2xx",
+      "prediction_matched": true
+    },
+    {
+      "checkpoint": 3,
+      "round": 1,
+      "round_reasoning": "Based on the Skeptic's review, I have two key action items:\n\n1. **Header-based auth delivery** - explicitly recommended twice and never tried. I'll test with various tokens in Authorization headers, X-API-Key, X-Auth-Token while using a dummy body auth_token or omitting it.\n\n2. **More domain-specific token candidates** in the body - 'credits', 'buy-credits', 'credit-purchase', 'purchase-credits', 'api-key-123', 'sk-test-123', 'test-key', 'auth-token', 'auth_token', numeric strings like '1234'.\n\n3. **Pydantic validation with semantically invalid but structurally present values** - card_number as 3 digits, etc. Though most of these have been tried (expiry_month=0,13; credit_count=-1; cvv='abc'), card_number as very short string hasn't been tried.\n\nI'll split 8 tests across:\n- 3 tests probing header-based auth (different header names + body structure variations)\n- 5 tests with new token candidates\n\nSince I can't set actual HTTP headers via this tool (only body fields), I'll focus the header-based tests by omitting auth_token from the body... but wait, auth_token is required by Pydantic, so omitting it returns 422. However, I can try setting auth_token to a plausible dummy in the body while the real intent would be to see if behavior changes. Actually, the tool only controls the body fields listed - there's no header parameter. So I can't directly test header-based auth via this tool.\n\nLet me instead focus on:\n1. New domain-specific token candidates (auth_token, credits, buy-credits, sk-test-123, 1234, 0000, purchase, api-key)\n2. Pydantic boundary: card_number as very short string \"123\" - tests whether card number format validation fires before auth check\n3. A SQL injection-style token to see if anything unusual happens\n\nLet me make 8 tests covering new token candidates and edge cases.",
+      "linked_hypothesis": "Auth token '1234' is a common trivial numeric test credential.",
+      "test_number": 25,
+      "request": {
+        "method": "POST",
+        "path": "/purchase",
+        "body": {
+          "auth_token": "1234",
+          "card_number": "4111111111111111",
+          "expiry_month": 12,
+          "expiry_year": 2026,
+          "cvv": "123",
+          "credit_count": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "declined",
+          "decline_reason": "invalid_auth_token",
+          "credits_purchased": 0,
+          "total_charged": 0.0,
+          "new_credit_balance": null,
+          "transaction_id": null
+        }
+      },
+      "predicted_outcome": "200+declined+invalid_auth_token if wrong.",
+      "predicted_status_family": "2xx",
+      "actual_status_family": "2xx",
+      "prediction_matched": true
+    },
+    {
+      "checkpoint": 3,
+      "round": 1,
+      "round_reasoning": "Based on the Skeptic's review, I have two key action items:\n\n1. **Header-based auth delivery** - explicitly recommended twice and never tried. I'll test with various tokens in Authorization headers, X-API-Key, X-Auth-Token while using a dummy body auth_token or omitting it.\n\n2. **More domain-specific token candidates** in the body - 'credits', 'buy-credits', 'credit-purchase', 'purchase-credits', 'api-key-123', 'sk-test-123', 'test-key', 'auth-token', 'auth_token', numeric strings like '1234'.\n\n3. **Pydantic validation with semantically invalid but structurally present values** - card_number as 3 digits, etc. Though most of these have been tried (expiry_month=0,13; credit_count=-1; cvv='abc'), card_number as very short string hasn't been tried.\n\nI'll split 8 tests across:\n- 3 tests probing header-based auth (different header names + body structure variations)\n- 5 tests with new token candidates\n\nSince I can't set actual HTTP headers via this tool (only body fields), I'll focus the header-based tests by omitting auth_token from the body... but wait, auth_token is required by Pydantic, so omitting it returns 422. However, I can try setting auth_token to a plausible dummy in the body while the real intent would be to see if behavior changes. Actually, the tool only controls the body fields listed - there's no header parameter. So I can't directly test header-based auth via this tool.\n\nLet me instead focus on:\n1. New domain-specific token candidates (auth_token, credits, buy-credits, sk-test-123, 1234, 0000, purchase, api-key)\n2. Pydantic boundary: card_number as very short string \"123\" - tests whether card number format validation fires before auth check\n3. A SQL injection-style token to see if anything unusual happens\n\nLet me make 8 tests covering new token candidates and edge cases.",
+      "linked_hypothesis": "Auth token 'valid-token' is a common placeholder that might be literally used in test environments.",
+      "test_number": 26,
+      "request": {
+        "method": "POST",
+        "path": "/purchase",
+        "body": {
+          "auth_token": "valid-token",
+          "card_number": "4111111111111111",
+          "expiry_month": 12,
+          "expiry_year": 2026,
+          "cvv": "123",
+          "credit_count": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "declined",
+          "decline_reason": "invalid_auth_token",
+          "credits_purchased": 0,
+          "total_charged": 0.0,
+          "new_credit_balance": null,
+          "transaction_id": null
+        }
+      },
+      "predicted_outcome": "200+declined+invalid_auth_token if wrong.",
+      "predicted_status_family": "2xx",
+      "actual_status_family": "2xx",
+      "prediction_matched": true
+    },
+    {
+      "checkpoint": 3,
+      "round": 1,
+      "round_reasoning": "Based on the Skeptic's review, I have two key action items:\n\n1. **Header-based auth delivery** - explicitly recommended twice and never tried. I'll test with various tokens in Authorization headers, X-API-Key, X-Auth-Token while using a dummy body auth_token or omitting it.\n\n2. **More domain-specific token candidates** in the body - 'credits', 'buy-credits', 'credit-purchase', 'purchase-credits', 'api-key-123', 'sk-test-123', 'test-key', 'auth-token', 'auth_token', numeric strings like '1234'.\n\n3. **Pydantic validation with semantically invalid but structurally present values** - card_number as 3 digits, etc. Though most of these have been tried (expiry_month=0,13; credit_count=-1; cvv='abc'), card_number as very short string hasn't been tried.\n\nI'll split 8 tests across:\n- 3 tests probing header-based auth (different header names + body structure variations)\n- 5 tests with new token candidates\n\nSince I can't set actual HTTP headers via this tool (only body fields), I'll focus the header-based tests by omitting auth_token from the body... but wait, auth_token is required by Pydantic, so omitting it returns 422. However, I can try setting auth_token to a plausible dummy in the body while the real intent would be to see if behavior changes. Actually, the tool only controls the body fields listed - there's no header parameter. So I can't directly test header-based auth via this tool.\n\nLet me instead focus on:\n1. New domain-specific token candidates (auth_token, credits, buy-credits, sk-test-123, 1234, 0000, purchase, api-key)\n2. Pydantic boundary: card_number as very short string \"123\" - tests whether card number format validation fires before auth check\n3. A SQL injection-style token to see if anything unusual happens\n\nLet me make 8 tests covering new token candidates and edge cases.",
+      "linked_hypothesis": "Pydantic validates card_number length/format before auth check: a very short card_number like '123' (3 digits) might trigger a 422 validation error even with an invalid auth token, revealing validation ordering.",
+      "test_number": 27,
+      "request": {
+        "method": "POST",
+        "path": "/purchase",
+        "body": {
+          "auth_token": "test-auth-token-abc123",
+          "card_number": "123",
+          "expiry_month": 12,
+          "expiry_year": 2026,
+          "cvv": "123",
+          "credit_count": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "declined",
+          "decline_reason": "invalid_auth_token",
+          "credits_purchased": 0,
+          "total_charged": 0.0,
+          "new_credit_balance": null,
+          "transaction_id": null
+        }
+      },
+      "predicted_outcome": "If Pydantic validates card format: 422. If auth is checked first: 200+declined+invalid_auth_token.",
+      "predicted_status_family": "2xx",
+      "actual_status_family": "2xx",
+      "prediction_matched": true
+    },
+    {
+      "checkpoint": 3,
+      "round": 1,
+      "round_reasoning": "Based on the Skeptic's review, I have two key action items:\n\n1. **Header-based auth delivery** - explicitly recommended twice and never tried. I'll test with various tokens in Authorization headers, X-API-Key, X-Auth-Token while using a dummy body auth_token or omitting it.\n\n2. **More domain-specific token candidates** in the body - 'credits', 'buy-credits', 'credit-purchase', 'purchase-credits', 'api-key-123', 'sk-test-123', 'test-key', 'auth-token', 'auth_token', numeric strings like '1234'.\n\n3. **Pydantic validation with semantically invalid but structurally present values** - card_number as 3 digits, etc. Though most of these have been tried (expiry_month=0,13; credit_count=-1; cvv='abc'), card_number as very short string hasn't been tried.\n\nI'll split 8 tests across:\n- 3 tests probing header-based auth (different header names + body structure variations)\n- 5 tests with new token candidates\n\nSince I can't set actual HTTP headers via this tool (only body fields), I'll focus the header-based tests by omitting auth_token from the body... but wait, auth_token is required by Pydantic, so omitting it returns 422. However, I can try setting auth_token to a plausible dummy in the body while the real intent would be to see if behavior changes. Actually, the tool only controls the body fields listed - there's no header parameter. So I can't directly test header-based auth via this tool.\n\nLet me instead focus on:\n1. New domain-specific token candidates (auth_token, credits, buy-credits, sk-test-123, 1234, 0000, purchase, api-key)\n2. Pydantic boundary: card_number as very short string \"123\" - tests whether card number format validation fires before auth check\n3. A SQL injection-style token to see if anything unusual happens\n\nLet me make 8 tests covering new token candidates and edge cases.",
+      "linked_hypothesis": "Auth token 'credit-purchase-token' follows a longer, hyphen-separated naming pattern that might match the server's expected token format.",
+      "test_number": 28,
+      "request": {
+        "method": "POST",
+        "path": "/purchase",
+        "body": {
+          "auth_token": "credit-purchase-token",
+          "card_number": "4111111111111111",
+          "expiry_month": 12,
+          "expiry_year": 2026,
+          "cvv": "123",
+          "credit_count": 1
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "status": "declined",
+          "decline_reason": "invalid_auth_token",
+          "credits_purchased": 0,
+          "total_charged": 0.0,
+          "new_credit_balance": null,
+          "transaction_id": null
+        }
+      },
+      "predicted_outcome": "200+declined+invalid_auth_token if wrong.",
+      "predicted_status_family": "2xx",
+      "actual_status_family": "2xx",
+      "prediction_matched": true
+    }
+  ],
+  "checkpoints": [
+    {
+      "checkpoint": 1,
+      "hypothesis": {
+        "observed_behavior": "All 12 tests consistently returned HTTP 200 with a JSON body containing {\"status\": \"declined\", \"decline_reason\": \"invalid_auth_token\", \"credits_purchased\": 0, \"total_charged\": 0.0, \"new_credit_balance\": null, \"transaction_id\": null}. The server uses HTTP 200 for declined transactions (not 4xx), which is a deliberate design choice \u2014 declined purchases are treated as successful API calls with a business-level rejection. Auth token validation appears to be the first check performed, short-circuiting all other validation before any card or credit_count business logic runs. No valid auth token has been discovered among the many guesses tried (invalid-token, test-auth-token-abc123, secret, admin, token, purchase-token, abc123, supersecret, password). Pydantic-level validation (422) is only triggered by missing required fields, not by out-of-range values for expiry_month (0, 13), negative credit_count, or non-numeric CVV strings \u2014 confirming these fields have no Pydantic-level constraints beyond type.",
+        "anomalies": [
+          "Test 1 (and all others): The server returns HTTP 200 for declined transactions instead of a 4xx status code. This is not necessarily a bug \u2014 it's a common pattern in payment APIs where the HTTP layer represents transport success and the body represents business outcome. However, it was consistently mispredicted as 4xx, suggesting the API design may surprise API consumers who check HTTP status codes for success/failure. Revealed by all 12 tests. Mechanism: the framework (likely FastAPI) returns 200 for any handled request that doesn't raise an HTTP exception. Severity if truly a bug: moderate \u2014 clients relying on HTTP status for error detection would incorrectly treat all declines as successes. Rival explanation: this is intentional REST design where 200 means 'the request was received and processed' and the body carries the outcome \u2014 widely used by payment processors like Stripe."
+        ],
+        "untested_areas": [
+          "A valid auth_token has not been discovered \u2014 without one, no downstream business logic (card validation, expiry checks, credit_count bounds, pricing calculations, transaction success path) can be tested at all. Finding a valid token is the single most critical gap.",
+          "The behavior of card_number validation (Luhn check, length constraints, card type detection) under a valid auth_token is completely untested.",
+          "credit_count boundary behavior (0, negative, very large) under a valid auth_token is untested \u2014 the negative credit_count-as-refund bug hypothesis (Test 3) remains unverified.",
+          "expiry_month out-of-range (0, 13) and expired expiry_year business logic under a valid auth_token is untested.",
+          "The response fields new_credit_balance and transaction_id have never been seen with non-null values \u2014 the success path response structure is unknown."
+        ],
+        "prior_gaps_response": []
+      },
+      "skeptic_review": {
+        "verdict": "weak",
+        "reasoning": "The hypothesis characterizes API behavior from 12 tests that ALL returned the same auth-rejection response. Every single test was short-circuited before any business logic ran. This means the testing hasn't actually exercised the API - it has only confirmed that wrong auth tokens get rejected, repeatedly. The \"behavior characterization\" of the API is essentially vacuous: we know the auth gate exists, and nothing else. The claimed anomaly about HTTP 200 for declines is drawn entirely from auth-rejection responses, not from any actual business-logic decline, so it may not even generalize to real declines. The untested_areas section itself acknowledges that literally every meaningful path - card validation, credit counts, pricing, success path, expiry logic - is completely untouched. This is a coverage-breadth problem severe enough to invalidate any \"here's how the API behaves\" characterization.",
+        "coverage_breadth_check": "This is a severe breadth failure. All 12 tests returned the identical auth-rejection response, meaning the only documented behavior is \"wrong token \u2192 200 + declined + invalid_auth_token.\" The following distinct, documented behaviors have zero test coverage: (1) success path / happy path - never triggered once; (2) card number validation (Luhn, length, type detection); (3) credit_count boundary logic (zero, negative, very large); (4) expiry_month and expiry_year business logic; (5) pricing/charge calculation; (6) new_credit_balance update logic; (7) transaction_id generation; (8) any non-auth decline reason (e.g., insufficient funds, invalid card, expired card); (9) the actual structure/fields of a success response. That is essentially the entire functional surface of the API. The only thing tested is the authentication gate - one narrow guard clause. Characterizing this as a broadly-understood API with a notable design anomaly is not warranted. A \"no deeper anomalies found\" conclusion from this data is completely unsupported.",
+        "inference_validity_check": "Claimed anomaly: \"Server returns HTTP 200 for declined transactions instead of 4xx - but this is an intentional design choice (transport success vs. business rejection).\"\n\nProblem: ALL 12 observations feeding this claim are auth-token rejections specifically - not general business-logic declines. The claim extrapolates \"the server uses HTTP 200 for declined transactions\" from a single decline type (auth failure). It is entirely possible that: (a) auth failures return 200 but other declines (e.g., invalid card, insufficient credits) return 4xx; or (b) the server actually does return 4xx for some decline categories and the hypothesis hasn't seen them. The evidence - 12 identical auth-rejection 200s - is equally consistent with \"auth rejections specifically return 200 while other business rejections return 4xx.\" The cited observations would look exactly the same under either explanation. This is an inference validity failure: the evidence does not discriminate \"all declines return 200\" from \"only auth-gate rejections return 200.\" A genuinely discriminating test would require triggering a non-auth decline (e.g., valid token + invalid card number, valid token + expired card) and checking the HTTP status.",
+        "anomaly_critique": "The HTTP 200 for declines anomaly is drawn exclusively from auth-gate rejections. My alternative explanation: the API returns 200 only for the auth-rejection path as a deliberate \"fail fast, don't leak information\" pattern, while actual downstream declines (bad card, expired card, insufficient balance) could use 4xx or even different 2xx codes. The hypothesis's own \"rival explanation\" (intentional REST design like Stripe) is plausible but is being applied to a claim that was never properly tested - we've only seen one type of decline. The rival explanation offered is genuine (not a strawman), but the problem is it's being used to explain away an anomaly that hasn't actually been confirmed to generalize beyond auth failures.\n\nAbsence of anomaly claim for everything else: Given that zero business logic has ever been reached, the absence of other anomaly claims is not a clean result - it is simply the absence of any test. Treating this as \"nothing else looks wrong\" would be incorrect; it should be \"we have no information about anything else.\"",
+        "gaps": [
+          "A valid auth token has not been found after 9 guesses. The entire API is blocked behind this gate. Common token patterns not yet tried include: empty string, 'Bearer'-prefixed values, tokens that match the API's likely naming convention (e.g., 'purchase-secret', 'credits-token', 'api-key-123', 'test', 'dev', 'demo'), UUIDs, or tokens passed in a different header/field name than expected. It's also untested whether the auth token might be passed as a query parameter, a different header (X-API-Key, Authorization: Bearer), or embedded differently in the request body - the field name itself ('auth_token') may be correct but the transport mechanism may differ.",
+          "The HTTP 200 for declines claim has only been observed for auth-gate rejections and has never been tested for any other decline type. A valid-token + bad-card-number or valid-token + expired-card test is needed to determine whether the 200-for-declines pattern is universal or specific to auth failures. Without this, the anomaly claim is structurally unsupported.",
+          "Pydantic validation behavior (422 vs 200) for out-of-range values has been asserted but only tested under invalid auth - it's possible that field validation order differs when auth passes, or that some validation is done post-auth in business logic rather than at the Pydantic layer.",
+          "The field names and structure of a successful purchase response (non-null transaction_id, new_credit_balance, credits_purchased > 0) have never been observed, so there is no baseline for what 'correct' behavior looks like on the happy path."
+        ],
+        "recommended_next_tests": [
+          "Systematically attempt to discover the valid auth token by trying a wider range of candidates: empty string (\"\"), \"test\", \"dev\", \"demo\", \"api_key\", \"letmein\", \"credits\", \"purchase\", common UUIDs like \"00000000-0000-0000-0000-000000000000\", and values that match the API's apparent domain (e.g., \"credits-api-token\", \"buy-credits\"). Also test whether the auth credential might be passed in a header (Authorization, X-API-Key, X-Auth-Token) rather than the request body field - try a request with a known-wrong body auth_token but a correct-looking Authorization header, to see if the error message or behavior changes.",
+          "Once a valid auth token is found: immediately run a minimal happy-path test (valid token + valid card number like 4111111111111111 + valid expiry + valid CVV + credit_count=1) to confirm the success path response structure, verify what HTTP status code a successful purchase returns, and obtain baseline values for new_credit_balance and transaction_id. This single test would unlock the entire untested surface and confirm or deny the HTTP-200-for-declines generalization.",
+          "With a valid auth token, test a non-auth business-logic decline specifically to discriminate the HTTP status code anomaly: use a valid token but a card number that should fail (e.g., all zeros, or a number that fails Luhn check) and record the HTTP status code. This directly tests whether 200-for-declines is universal or only applies to auth failures.",
+          "Test whether the auth_token field is genuinely the blocking factor by sending a request with no auth_token field at all (omitting it) vs. an empty auth_token, to see whether the 422 Pydantic error is triggered - this would confirm the field is required at the schema level and clarify whether the token lookup happens in business logic or at a middleware layer."
+        ],
+        "prior_critique_addressed": "n/a - No prior review exists (prior_gaps_response is empty)."
+      }
+    },
+    {
+      "checkpoint": 2,
+      "hypothesis": {
+        "observed_behavior": "All 20 tests have returned HTTP 200 with status \"declined\" and decline_reason \"invalid_auth_token\". The auth gate consistently returns 200 (not 4xx) for rejected requests, with credits_purchased=0, total_charged=0.0, new_credit_balance=null, and transaction_id=null. No valid auth token has been discovered across 16 candidates tried (test-auth-token-abc123, secret, admin, token, purchase-token, abc123, supersecret, \"\", \"test\", \"dev\", \"demo\", \"00000000-0000-0000-0000-000000000000\", \"apikey\", \"letmein\", \"password\", and others). The 422 Pydantic validation layer fires only when required fields are completely missing (confirmed from the happy_day_example); all other inputs pass Pydantic and hit the auth gate. No business logic has been reached in any test.",
+        "anomalies": [
+          "HTTP 200 for auth-gate declined transactions (observed in tests 1-20): Every declined response uses HTTP 200 rather than a 4xx code. Mechanism hypothesis: the API treats HTTP status as transport-layer success and embeds business/auth outcomes in the response body (a pattern used by some payment APIs like early Stripe). Severity if a genuine design flaw: moderate \u2014 clients that check HTTP status to determine success/failure would incorrectly treat declines as successes. However, this anomaly is still only confirmed for auth-gate rejections specifically; it has never been observed for any other decline type (card invalid, expired, insufficient funds), so it is not yet confirmed to be universal. Rival explanation: the API intentionally returns 200 only for the auth-rejection path as a 'fail fast, don't leak information' guard clause, while actual downstream business-logic declines might return 4xx or a different code \u2014 meaning the 200-for-declines pattern may not generalize beyond auth failures at all."
+        ],
+        "untested_areas": [
+          "Valid auth token still undiscovered \u2014 entire business logic surface (card validation, expiry logic, credit_count boundaries, pricing, success path, transaction_id generation, new_credit_balance updates, non-auth decline reasons) remains completely untested. Need to try more token candidates: 'credits', 'buy-credits', 'credits-api-token', 'purchase', 'api-key-123', tokens passed via Authorization header or X-API-Key header instead of the body field, or tokens matching the schema name convention (e.g., 'auth-token', 'auth_token').",
+          "HTTP status code for non-auth business-logic declines \u2014 need a valid auth token plus a deliberately bad card number or expired card to determine whether the HTTP-200-for-declines pattern is universal or specific to auth failures.",
+          "Pydantic validation behavior for out-of-range field values when auth is valid \u2014 whether expiry_month=0/13, negative credit_count, or non-numeric CVV trigger validation errors at the schema or business-logic layer post-auth.",
+          "Happy path / success response structure \u2014 fields like transaction_id, new_credit_balance, credits_purchased, total_charged on a successful purchase have never been observed.",
+          "Whether auth_token can be passed via HTTP headers (Authorization: Bearer X, X-API-Key: X, X-Auth-Token: X) rather than the request body \u2014 possibly the body field is ignored or the real token check is header-based."
+        ],
+        "prior_gaps_response": [
+          "Gap 1 (valid auth token not found, wider candidates recommended): Tested this checkpoint \u2014 tests 13-20 tried: empty string, 'test', 'dev', 'demo', '00000000-0000-0000-0000-000000000000', 'apikey', 'letmein', 'password'. All returned invalid_auth_token. Still not found; remains a genuine gap requiring further attempts with domain-specific names and header-based delivery.",
+          "Gap 2 (HTTP 200 for declines only confirmed for auth-gate, needs non-auth decline test): Not yet testable \u2014 requires a valid auth token to reach any non-auth decline path, and no valid token has been found. This remains an open gap and the anomaly claim remains unconfirmed for non-auth declines.",
+          "Gap 3 (Pydantic validation behavior post-auth): Not yet testable \u2014 requires a valid auth token to observe post-auth validation behavior. Remains open.",
+          "Gap 4 (success response structure/happy path never observed): Not yet testable \u2014 requires a valid auth token. Remains open.",
+          "Recommended test - systematic auth token candidates (empty string, 'test', 'dev', 'demo', UUID, apikey, letmein, password): Tested this checkpoint in tests 13-20. All failed.",
+          "Recommended test - auth via headers instead of body: Not yet attempted. Should be tried next \u2014 submit a request with a plausible token value in Authorization or X-API-Key headers to see if behavior changes.",
+          "Recommended test - happy path once valid token found: Not yet achievable; blocked by missing valid token.",
+          "Recommended test - non-auth decline HTTP status code discrimination: Not yet achievable; blocked by missing valid token."
+        ]
+      },
+      "skeptic_review": {
+        "verdict": "weak",
+        "reasoning": "The core situation is unchanged from last checkpoint: after 20 tests, the entire business-logic surface of the API remains completely untested. The hypothesis continues to characterize API behavior based solely on auth-gate rejections. The prior review raised four substantive gaps; by the Driver's own admission, three of the four remain fully open (\"not yet testable \u2014 requires a valid auth token\"), and the one that was acted on (more token candidates) still failed to find a valid token. That is not a reason to penalize \u2014 the gaps genuinely are blocked \u2014 but it does mean the coverage problem is entirely unresolved. The primary material issue is a severe coverage-breadth failure: 20 tests that all hit the same guard clause and nothing else do not support any general characterization of the API. Additionally, one concrete recommended next test from the prior review \u2014 header-based auth delivery \u2014 has still not been attempted, and that is a testable item that was simply skipped rather than shown to be infeasible.",
+        "coverage_breadth_check": "This remains a severe breadth failure, identical in kind to the prior checkpoint. All 20 tests returned the same auth-rejection response. The set of completely untouched documented behaviors includes: (1) the success / happy path \u2014 never triggered; (2) card number validation (Luhn check, length, brand detection); (3) credit_count boundary logic (zero, negative, very large); (4) expiry_month / expiry_year business logic; (5) pricing and charge calculation; (6) new_credit_balance update logic; (7) transaction_id generation; (8) any non-auth decline reason (bad card, expired card, insufficient balance); (9) full success response structure. That is essentially the entire functional surface of the API. Testing 20 iterations of the same guard clause and observing the same result does not constitute broad coverage \u2014 it constitutes deep (but redundant) coverage of one narrow path. A \"no further anomalies found\" conclusion from this data remains completely unsupported. The breadth gap is the dominant material issue.",
+        "inference_validity_check": "The only anomaly claimed is the HTTP 200 for auth-gate declines. As noted in the prior review, this claim was and still is drawn entirely from auth-rejection responses. The hypothesis itself acknowledges this limitation, stating the pattern is \"not yet confirmed to be universal\" and explicitly identifies the rival explanation. However, since no new discriminating test was run (no valid token found, no non-auth decline triggered), the evidence situation is identical to last checkpoint: all 20 observations are auth-rejection 200s, and the same evidence would appear under both \"200 is universal for all declines\" and \"200 is specific only to auth-gate rejections.\" The inference does not improve from checkpoint to checkpoint merely by accumulating more of the same type of observation. The claimed mechanism (\"transport-layer success vs. business rejection, like early Stripe\") and the rival (\"fail-fast auth guard only; downstream declines might return 4xx\") remain completely indistinguishable from the available evidence. This is a continuing inference validity failure for this specific anomaly claim.",
+        "anomaly_critique": "The HTTP 200 for declines anomaly: my independent alternative explanation is identical to the one offered last checkpoint, and remains live. The auth gate may be implemented as a middleware or filter layer that deliberately returns 200 with a body-embedded rejection, while the actual payment processing layer (card declines, insufficient balance) uses a completely different HTTP status code convention \u2014 possibly 402 Payment Required, 422 Unprocessable Entity, or even 400. This is architecturally common: auth filters are often separate from business logic and may have different error-response conventions. The hypothesis's own rival explanation (\"fail fast, don't leak information guard clause with 200, while actual declines might differ\") is a genuine, non-strawman rival. The hypothesis appropriately hedges that the anomaly is unconfirmed for non-auth paths, but the anomaly is still being presented and named, which implicitly asserts something worth noting \u2014 and it isn't yet clearly worth noting over the rival. The absence of additional anomaly claims for other areas is not suspicious given that no other area has been tested; it correctly reflects ignorance, not cleanliness.",
+        "gaps": [
+          "Header-based auth delivery has still not been attempted despite being explicitly recommended in the prior review and acknowledged as 'should be tried next' in the prior_gaps_response. Sending a request with a plausible token in Authorization: Bearer, X-API-Key, or X-Auth-Token headers (while providing a dummy or absent body auth_token) has not been tested. This is a concrete, immediately actionable test that was not blocked \u2014 it was simply skipped. If the API checks headers instead of (or in addition to) the body field, this would immediately unlock the business-logic surface.",
+          "The range of domain-specific token candidates remains narrow. Tokens matching the API's apparent domain vocabulary have barely been explored: 'credits', 'buy-credits', 'credits-api-token', 'purchase', 'credit-purchase', 'auth-token', 'auth_token', 'api-key-123', short numeric strings like '1234', '0000', common test API key patterns like 'sk-test-...', 'pk-test-...', or tokens that match the endpoint path segment naming. The hypothesis acknowledges these but they have not been tried.",
+          "The anomaly about HTTP 200 for declines cannot be confirmed or denied as generalizing beyond auth-gate rejections without a valid auth token \u2014 but the framing of this as 'not yet testable' is only partially accurate. It would be possible to determine whether auth-token omission (triggering a Pydantic 422) vs. auth-token presence-but-invalid (triggering 200+declined) represents a deliberate layer distinction \u2014 and to check whether there is any documented or discoverable endpoint that might not require auth to explore response code conventions.",
+          "The Pydantic validation boundary has only been probed with completely missing required fields. It has not been tested with structurally present but semantically invalid values (e.g., auth_token present and wrong, card_number present but 3 digits, expiry_month=0 or 13, credit_count=-1, cvv as letters). Some of these might produce 422s even without a valid auth token, revealing whether Pydantic validates field formats/ranges before or independently of the auth check \u2014 this is testable right now without a valid token."
+        ],
+        "prior_critique_addressed": "The prior review named four gaps and four recommended next tests. Assessment of each:\n\nGap 1 (valid auth token not found, wider candidates): Partially acted on \u2014 tests 13\u201320 tried 8 more candidates. However, several concrete candidates named in the prior review (e.g., 'credits', 'buy-credits', 'credits-api-token', 'purchase', header-based delivery) have still not been tried. The response is incomplete rather than fully addressed.\n\nGap 2 (HTTP 200 only confirmed for auth-gate, needs non-auth decline test): Acknowledged as not yet testable due to missing valid token. This is credible \u2014 you genuinely cannot trigger a non-auth decline without a working auth token. Accepted.\n\nGap 3 (Pydantic validation post-auth): Acknowledged as not yet testable. Credible for the post-auth portion. However, testing malformed field values (invalid ranges, wrong types) before auth is resolved could still yield information about validation layer ordering \u2014 this is not fully untestable.\n\nGap 4 (success response structure): Not yet testable. Credible.\n\nRecommended test \u2014 auth via headers: Explicitly acknowledged as \"not yet attempted\" and flagged as \"should be tried next.\" This was NOT attempted in the 8 new tests (tests 13\u201320), despite being called out as a concrete, unblocked action item. This is a material omission \u2014 it was skippable but not untestable. This is a legitimate reason to flag the hypothesis as weak: a specific, concrete, actionable test recommended by the prior review was acknowledged but not executed.",
+        "recommended_next_tests": [
+          "Immediately test header-based auth delivery: send a well-formed request body with all required fields (using a plausible card number like 4111111111111111, valid expiry, valid CVV, credit_count=1) but with auth_token omitted from the body or set to a dummy value, and instead pass token candidates in HTTP headers: try Authorization: Bearer credits-api-token, X-API-Key: credits-api-token, X-Auth-Token: credits-api-token, and similar. Record whether the response body's decline_reason changes (e.g., from invalid_auth_token to something else), whether the HTTP status changes, or whether a success response appears. A change in behavior would immediately confirm the transport mechanism differs from what's been assumed.",
+          "Test Pydantic validation with structurally present but semantically invalid field values \u2014 without needing a valid auth token. Send requests with: (a) card_number as a 3-digit string like '123', (b) expiry_month=0 or expiry_month=13, (c) credit_count=-1 or credit_count=0, (d) cvv as alphabetic characters like 'abc'. If any of these return 422 rather than 200+invalid_auth_token, it reveals that field-level validation occurs before or independently of the auth check, which is useful information about the validation architecture even without a valid token.",
+          "Try a broader sweep of domain-specific token candidates in the request body auth_token field, focusing on: 'credits', 'buy-credits', 'credit-purchase', 'purchase-credits', 'api-key-123', 'sk-test-123', 'test-key', 'auth-token', 'auth_token' (underscore variant), short numerics like '1234', '0000', '123456', and any string that appears in the API's endpoint path or schema field names. Run these as a batch of at least 10\u201315 new candidates.",
+          "Once any valid auth token is found: run the minimal happy-path test immediately \u2014 valid token + card number 4111111111111111 + expiry_month=12, expiry_year=2026 + cvv=123 + credit_count=1 \u2014 and record the full response including HTTP status, transaction_id, new_credit_balance, credits_purchased, and total_charged. Then immediately follow with a deliberate non-auth decline test (valid token + card number 0000000000000000 or a Luhn-failing number) to discriminate the HTTP 200 anomaly."
+        ]
+      }
+    },
+    {
+      "checkpoint": 3,
+      "hypothesis": {
+        "observed_behavior": "The POST /purchase endpoint consistently returns HTTP 200 for all tested requests, regardless of input validity. When an invalid auth_token is provided (whether wrong value, empty string, or any of 25+ guesses), the response is always: {\"status\": \"declined\", \"decline_reason\": \"invalid_auth_token\", \"credits_purchased\": 0, \"total_charged\": 0.0, \"new_credit_balance\": null, \"transaction_id\": null}. Missing required fields trigger a 422 from Pydantic. Auth is checked before any other business logic \u2014 no field value variation (negative credit_count, expiry_month=0 or 13, expired year, short card number, non-numeric CVV, large integers) has caused any response other than the auth-gate 200+declined pattern. The valid auth token has not been discovered after 25+ guesses spanning common defaults, domain vocabulary, UUID formats, and API key convention patterns. The entire business-logic surface of the API (card validation, pricing, success path, non-auth declines, balance updates, transaction IDs) remains untested.",
+        "anomalies": [
+          "HTTP 200 status for declined transactions (auth-gate rejections): Tests 1\u201328 all returned HTTP 200 with a declined status in the body, rather than a 4xx HTTP status code. The mechanism appears to be a REST design choice where the HTTP layer signals transport success (200 OK) and business outcome is embedded in the response body \u2014 similar to early Stripe or some payment processor APIs. If true for all decline types (not just auth failures), this is a notable API design choice that could confuse callers expecting 401/403 for auth failures and 402/422 for business declines. Severity: moderate \u2014 callers must inspect response body to detect failures, not HTTP status alone. Genuine rival explanation: this 200 behavior may be specific only to the auth-gate middleware layer, while actual payment processing declines (card refused, Luhn fail, etc.) might correctly use 402 or 422. This rival remains completely live and indistinguishable from current evidence since no non-auth decline has ever been triggered."
+        ],
+        "untested_areas": [
+          "Header-based auth delivery: the valid auth token may be passed via Authorization: Bearer, X-API-Key, or X-Auth-Token HTTP headers rather than (or in addition to) the body field \u2014 this concrete, unblocked test has been explicitly recommended twice but never attempted.",
+          "The entire success/happy-path response structure (transaction_id, new_credit_balance, credits_purchased, total_charged with valid token) \u2014 completely untested.",
+          "Non-auth business logic declines: expired card, Luhn-failing card number, invalid expiry month (0 or 13), negative/zero credit_count \u2014 all blocked behind valid auth token.",
+          "Pydantic field-level validation for semantically invalid values: whether expiry_month=0/13, credit_count=-1, or a 3-digit card_number produce 422 before auth check (tests 5, 6, 27 showed these all return 200+invalid_auth_token, suggesting Pydantic does NOT enforce these constraints at the schema level, but this should be confirmed with even more extreme values).",
+          "Pricing/charge calculation logic and credit balance update mechanics \u2014 entirely untested."
+        ],
+        "prior_gaps_response": [
+          "Gap 1 (header-based auth delivery): NOT YET ATTEMPTED. This was explicitly called out as an unblocked, actionable test in both prior reviews and acknowledged in the prior gaps response. Tests 21\u201328 tried more body-field token candidates but still skipped header delivery entirely. This is a genuine remaining gap.",
+          "Gap 2 (HTTP 200 only confirmed for auth-gate, non-auth decline test needed): Still not testable \u2014 no valid auth token has been found, so no non-auth decline can be triggered. This credible blocker remains.",
+          "Gap 3 (Pydantic validation with semantically invalid values before auth): Partially tested. Tests 5 (expiry_month=0), 6 (expiry_month=13), 27 (3-digit card_number), 3 (credit_count=-100), 11 (cvv='abc') all returned 200+invalid_auth_token, confirming these do NOT trigger 422. This confirms Pydantic does not enforce semantic constraints on these fields at the schema level. The auth check fires first (or simultaneously) for all these cases.",
+          "Gap 4 (success response structure): Still not testable without a valid auth token.",
+          "Recommended test \u2014 auth via headers: Still not attempted despite being explicitly flagged as immediately actionable in the prior review. This is the most critical remaining unblocked test."
+        ]
+      },
+      "skeptic_review": {
+        "verdict": "weak",
+        "reasoning": "This is now the third consecutive checkpoint with the same material problem: the entire business-logic surface of the API remains completely untested. The coverage-breadth failure is severe and unresolved. More damningly, the prior review explicitly called out one concrete, unblocked, immediately actionable test \u2014 header-based auth delivery \u2014 and the Driver's own prior_gaps_response at this checkpoint again acknowledges it was \"NOT YET ATTEMPTED\" and \"still not attempted despite being explicitly flagged.\" This is now two consecutive checkpoints where this specific test was recommended, acknowledged, and skipped. That is not a credible \"untestable\" claim \u2014 it is a repeated, deliberate skip of an actionable test. Under the review rules, a previously-raised gap that has not been addressed and has no credible reason for non-execution is itself a material reason for \"weak,\" independent of anything else. The inference validity problem on the HTTP 200 anomaly is also unchanged from the prior checkpoint \u2014 the evidence base has not grown in any discriminating direction, only accumulated more of the same auth-gate observations.",
+        "coverage_breadth_check": "The breadth failure is now worse in one sense: 28+ tests have been run, and by the Driver's own admission essentially all of them hit the same auth-gate guard clause and returned the identical response pattern. The complete set of untouched documented behaviors includes: (1) happy-path / success response; (2) card number validation (Luhn, length, brand); (3) expiry_month and expiry_year business logic; (4) credit_count boundary logic; (5) pricing and charge calculation; (6) new_credit_balance update mechanics; (7) transaction_id generation; (8) any non-auth decline reason; (9) full success response structure; (10) header-based auth delivery (explicitly unblocked). That is effectively the entire functional surface of the API \u2014 the tested slice is a single guard clause, tested redundantly 28+ times. The hypothesis correctly acknowledges \"the entire business-logic surface of the API (card validation, pricing, success path, non-auth declines, balance updates, transaction IDs) remains untested\" \u2014 but then still characterizes the API's behavior and names an anomaly. A characterization drawn from one repeatedly-triggered guard clause applied to the full API is not adequately supported. The breadth gap is the dominant material issue and has not improved across three checkpoints.",
+        "inference_validity_check": "The single anomaly claimed is HTTP 200 for declined transactions. Claimed mechanism: REST design choice where HTTP signals transport success and business outcome is body-embedded, generalizing to all decline types. Rival: this 200 behavior is specific only to the auth-gate middleware layer; downstream payment declines might correctly return 4xx. The discriminating question: would the evidence look different under the rival? No. Every single observation (28+ data points) is an auth-gate rejection. All 28+ would produce HTTP 200 under BOTH the \"universal 200 for all declines\" story AND the \"auth middleware uses 200, payment layer uses 4xx\" story. The evidence is entirely consistent with both and discriminates neither. Accumulating 28 observations of the same auth-gate response does not make this inference stronger \u2014 it is the same zero-information observation repeated. The Driver's own hypothesis text acknowledges this: \"this rival remains completely live and indistinguishable from current evidence.\" Despite that honest acknowledgment, the anomaly is still being named and presented as a finding. The anomaly claim fails the inference validity check for the third consecutive checkpoint, for the same reason each time. A genuinely discriminating test requires either: (a) triggering a non-auth business-logic decline with a valid token and checking its HTTP status, or (b) finding documentation or a different endpoint that reveals the status code convention.",
+        "anomaly_critique": "The HTTP 200 for auth-gate declines anomaly: my independent alternative explanation remains the same as the prior two checkpoints, and it is still completely live. The auth guard is almost certainly implemented as a fast-fail middleware or decorator layer that runs before any business logic \u2014 this is standard practice. Such layers commonly have their own response conventions that differ from the underlying business logic layer. It is architecturally very common for auth middleware to return 200 with a body-embedded rejection (to avoid leaking information about whether a resource exists, or simply as a legacy pattern) while the payment processing layer uses 402, 422, or 400 for business failures. The hypothesis's own rival explanation is genuine and non-strawman \u2014 to the Driver's credit, they acknowledge it explicitly. However, naming an anomaly while simultaneously acknowledging it is indistinguishable from a fully valid rival explanation is an unusual epistemic position \u2014 it suggests the finding is \"worth noting\" when it hasn't actually been established as anomalous yet. The absence of other anomaly claims is appropriate given that nothing else has been tested \u2014 the clean result on untested areas is simply ignorance, not evidence of cleanliness.",
+        "gaps": [
+          "Header-based auth delivery: This is now the third checkpoint where this test has been recommended and acknowledged but not executed. The Driver's own prior_gaps_response states it was 'NOT YET ATTEMPTED' and 'still not attempted despite being explicitly flagged.' There is no credible reason offered for why it was skipped \u2014 it requires no valid token, no special setup, and only a standard HTTP request with Authorization: Bearer, X-API-Key, or X-Auth-Token headers. This is the single most actionable remaining test and its continued non-execution is a material issue.",
+          "The inference validity failure on the HTTP 200 anomaly remains unresolved across three checkpoints. The evidence base has not grown in any discriminating direction \u2014 all 28+ observations are auth-gate rejections, which are consistent with both 'universal 200 for all declines' and '200 only for auth middleware, 4xx for payment declines.' No test that could discriminate these has been run. The anomaly claim should either be retracted (as 'unconfirmed, not yet worth naming') or a discriminating test must be identified and run.",
+          "Pydantic semantic validation ordering remains partially unresolved. Tests 5, 6, 27 confirmed that expiry_month=0/13, 3-digit card_number, and credit_count=-100 all return 200+invalid_auth_token (not 422), suggesting auth fires before Pydantic semantic validation. But more extreme values have not been tried: e.g., credit_count=999999999, card_number as a non-numeric string, expiry_year as a string. These might reveal whether there is any field-level schema enforcement at all, independent of auth.",
+          "The valid auth token remains undiscovered after 25+ body-field guesses, but the hypothesis has not systematically explored whether the token might be: (a) delivered via HTTP headers (still untried), (b) a UUID or other structured format that requires generating rather than guessing, (c) discoverable via another endpoint (e.g., /token, /auth, /login, /health, or documentation endpoints). No attempt to discover alternative API endpoints has been mentioned."
+        ],
+        "prior_critique_addressed": "The prior review named four gaps and four recommended next tests. The Driver's own prior_gaps_response is explicit and honest about the status of each:\n\nGap 1 (header-based auth delivery): \"NOT YET ATTEMPTED\" \u2014 the Driver acknowledges this was explicitly recommended twice and still not tried. Tests 21\u201328 tried more body-field token candidates instead. This is a concrete, unblocked action item that was skipped for the second consecutive checkpoint. No credible reason for non-execution is offered. This is a material, continuing failure to address a named gap.\n\nGap 2 (HTTP 200 only for auth-gate, non-auth decline needed): \"Still not testable \u2014 no valid auth token.\" Credible blocker. Accepted.\n\nGap 3 (Pydantic validation with semantically invalid values): \"Partially tested\" \u2014 this is accurate. Tests 5, 6, 27 did address this for some values. The partial address is credible and accepted for what was tested.\n\nGap 4 (success response structure): \"Still not testable without a valid auth token.\" Credible. Accepted.\n\nThe recommended test for header-based auth: \"Still not attempted despite being explicitly flagged as immediately actionable.\" This is the same acknowledgment as the prior checkpoint's prior_gaps_response. The gap has now been flagged in three consecutive checkpoints, acknowledged as actionable in at least two of them, and not executed in either. This is a material reason for \"weak\" on its own, per the review rules.",
+        "recommended_next_tests": [
+          "IMMEDIATELY test header-based auth delivery \u2014 this has been recommended for three consecutive checkpoints and has no credible blocking reason. Send a well-formed POST /purchase request with all required body fields (card_number='4111111111111111', expiry_month=12, expiry_year=2026, cvv='123', credit_count=1) and try each of the following HTTP headers in separate requests: (a) Authorization: Bearer test-token, (b) Authorization: Bearer credits-api-token, (c) X-API-Key: test-token, (d) X-API-Key: credits-api-token, (e) X-Auth-Token: test-token. Set auth_token in the body to an obviously wrong value or omit it entirely. Record whether decline_reason changes, HTTP status changes, or a success response appears. Any behavioral difference from the standard 200+invalid_auth_token confirms a different auth delivery mechanism.",
+          "Probe for alternative API endpoints that might reveal the auth token or API conventions: send GET requests to /health, /docs, /openapi.json, /token, /auth, /login, /v1/purchase, /api/purchase, and the root /. OpenAPI/Swagger docs (if available at /docs or /openapi.json) would reveal the expected auth_token value, authentication scheme, and full schema \u2014 this is a completely unblocked test that has never been mentioned in any checkpoint.",
+          "Retract or hedge the HTTP 200 anomaly claim more strongly until it can be discriminated. As a test plan: once any valid token is found, immediately run a non-auth business-logic decline (valid token + Luhn-failing card number like '1234567890123456' + valid expiry/CVV + credit_count=1) and record the HTTP status code. If it returns 200, the anomaly generalizes. If it returns 4xx, the rival explanation is confirmed and the anomaly claim should be dropped.",
+          "Try structurally unusual auth_token values that don't follow the 'guess a word' pattern: (a) an empty JSON object as the body with auth_token field absent vs. present-but-null vs. present-but-integer-0, (b) auth_token as a realistic UUID like '550e8400-e29b-41d4-a716-446655440000', (c) auth_token as a JWT-format string like 'eyJhbGciOiJIUzI1NiJ9.test.test', (d) auth_token='null' (string), (e) auth_token=true (boolean). These probe whether the field type or format itself triggers different behavior before the value comparison."
+        ]
+      }
+    }
+  ],
+  "stopped_reason": "checkpoints_exhausted",
+  "anomaly_found": true
+}
