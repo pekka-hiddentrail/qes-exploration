@@ -18,6 +18,7 @@ used to repeatedly, reliably reproduce this exact bug across many live runs.
 import subprocess
 import sys
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
@@ -44,11 +45,15 @@ def running_server():
                 time.sleep(0.2)
         else:
             proc.terminate()
-            raise RuntimeError("complex_sut test server did not start in time")
+            pytest.fail("complex_sut test server did not start in time")
         yield BASE_URL
     finally:
         proc.terminate()
-        proc.wait(timeout=5)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
 
 
 def _submit(base_url, client_id, payload="x"):
@@ -57,15 +62,23 @@ def _submit(base_url, client_id, payload="x"):
         return response.json()
 
 
+def _fresh_client_id(label: str) -> str:
+    # WINDOW_SECONDS is 600 - a hardcoded id would carry spent quota into any
+    # later invocation within the same server session (a retry, a future
+    # parametrization). A fresh uuid per call keeps each test unconditionally
+    # independent of what ran before it.
+    return f"regression-{label}-{uuid.uuid4()}"
+
+
 def test_sequential_requests_never_exceed_the_rate_limit(running_server):
-    client_id = "regression-sequential"
+    client_id = _fresh_client_id("sequential")
     responses = [_submit(running_server, client_id) for _ in range(RATE_LIMIT + 3)]
     accepted_count = sum(1 for r in responses if r["status"] == "accepted")
     assert accepted_count == RATE_LIMIT
 
 
 def test_concurrent_burst_overcounts_past_the_rate_limit(running_server):
-    client_id = "regression-concurrent"
+    client_id = _fresh_client_id("concurrent")
     burst_size = 20
     with ThreadPoolExecutor(max_workers=burst_size) as pool:
         responses = list(pool.map(lambda _: _submit(running_server, client_id), range(burst_size)))

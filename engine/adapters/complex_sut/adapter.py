@@ -64,6 +64,21 @@ def _call_sut_sequential(request_body: dict, request_count: int) -> list[dict]:
     return [call_sut_once(BASE_URL, TEST_ENDPOINT_PATH, request_body) for _ in range(request_count)]
 
 
+def _compute_correctness(responses: list[dict]) -> tuple[int, int | None, str]:
+    accepted_count = sum(1 for r in responses if r["body"].get("status") == "accepted")
+    limit = next((r["body"].get("limit") for r in responses if isinstance(r.get("body"), dict) and "limit" in r["body"]), None)
+    if limit is None:
+        # Every response was missing the limit field (malformed SUT response,
+        # connectivity issue) - "correct" would silently assert something we
+        # have no actual basis to claim.
+        actual_correctness = "unknown"
+    elif accepted_count > limit:
+        actual_correctness = "overcounted"
+    else:
+        actual_correctness = "correct"
+    return accepted_count, limit, actual_correctness
+
+
 def execute_test(test: dict, test_number: int) -> dict:
     request_count = test["request_count"]
     concurrent = test["concurrent"]
@@ -91,9 +106,7 @@ def execute_test(test: dict, test_number: int) -> dict:
         }
 
     responses = _call_sut_concurrent(request_body, request_count) if concurrent else _call_sut_sequential(request_body, request_count)
-    accepted_count = sum(1 for r in responses if r["body"].get("status") == "accepted")
-    limit = next((r["body"].get("limit") for r in responses if isinstance(r.get("body"), dict) and "limit" in r["body"]), None)
-    actual_correctness = "overcounted" if (limit is not None and accepted_count > limit) else "correct"
+    accepted_count, limit, actual_correctness = _compute_correctness(responses)
     return {
         "test_number": test_number,
         "request": request,
@@ -115,7 +128,8 @@ def describe_test_for_log(test: dict) -> str:
 def describe_result_for_log(result: dict) -> str:
     if result.get("skipped"):
         return f"SKIPPED - {result['skip_reason']}"
-    return f"{result['actual_correctness']} (accepted {result['accepted_count']}/{result['request']['request_count']}, limit {result['limit']})"
+    limit = result["limit"] if result["limit"] is not None else "?"
+    return f"{result['actual_correctness']} (accepted {result['accepted_count']}/{result['request']['request_count']}, limit {limit})"
 
 
 CASTING_TOOL = {

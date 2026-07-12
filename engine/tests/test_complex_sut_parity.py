@@ -1,8 +1,11 @@
 """Asserts the complex_sut adapter's per-SUT pieces are unchanged from
-experiments/complex-sut-poc/run_live.py, except for the deliberate,
-Copilot-review-informed addition of client_id/payload string-type checks
-(the same class of gap fixed in the token_purchase adapter after PR review -
-applied here proactively while porting, not discovered the hard way twice)."""
+experiments/complex-sut-poc/run_live.py, except for two deliberate
+divergences: the proactive addition of client_id/payload string-type checks
+(the same class of gap fixed in the token_purchase adapter after PR review,
+applied here before it could be hit a second time), and a fix to
+_compute_correctness silently asserting "correct" when the SUT's responses
+are missing the limit field entirely - a PR review on this very adapter
+caught it."""
 
 import importlib.util
 import sys
@@ -67,3 +70,24 @@ def test_validate_casting_response_now_also_rejects_non_string_client_id(origina
 
     engine_errors = complex_sut_adapter.validate_casting_response(data)
     assert any("client_id" in e and "string" in e for e in engine_errors)
+
+
+def test_compute_correctness_overcounted_when_accepted_exceeds_limit():
+    responses = [{"body": {"status": "accepted", "used": i, "limit": 5}} for i in range(1, 8)]
+    accepted_count, limit, actual_correctness = complex_sut_adapter._compute_correctness(responses)
+    assert (accepted_count, limit, actual_correctness) == (7, 5, "overcounted")
+
+
+def test_compute_correctness_correct_when_within_limit():
+    responses = [{"body": {"status": "accepted", "used": i, "limit": 5}} for i in range(1, 4)]
+    accepted_count, limit, actual_correctness = complex_sut_adapter._compute_correctness(responses)
+    assert (accepted_count, limit, actual_correctness) == (3, 5, "correct")
+
+
+def test_compute_correctness_unknown_when_limit_missing_from_every_response():
+    # The bug a PR review caught: this used to silently default to "correct"
+    # when every response was malformed/missing the limit field, asserting
+    # something with no actual basis.
+    responses = [{"body": {"error": "non-JSON response from SUT", "raw_text": "<html>502</html>"}}]
+    accepted_count, limit, actual_correctness = complex_sut_adapter._compute_correctness(responses)
+    assert (accepted_count, limit, actual_correctness) == (0, None, "unknown")
