@@ -57,8 +57,9 @@ def call_tool_with_retry(
                 messages=messages,
             )
         except _RETRYABLE_API_ERRORS as e:
+            action = "retrying" if attempt < max_attempts else "giving up"
             last_errors = [f"transient API error ({type(e).__name__}): {e}"]
-            print(f"  attempt {attempt} hit {last_errors[0]} - retrying")
+            print(f"  attempt {attempt} hit {last_errors[0]} - {action}")
             if attempt < max_attempts:
                 time.sleep(min(2 ** (attempt - 1), 30))
             continue
