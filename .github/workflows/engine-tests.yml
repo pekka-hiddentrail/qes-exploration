@@ -1,0 +1,27 @@
+name: engine tests
+
+"on":
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: pip install -r engine/requirements.txt
+
+      - name: Compile-check engine/
+        run: python -m compileall -q engine
+
+      - name: Run engine test suite
+        run: python -m pytest engine/tests -v
