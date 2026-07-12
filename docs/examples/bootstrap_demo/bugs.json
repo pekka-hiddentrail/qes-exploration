@@ -1,0 +1,19 @@
+[
+  {
+    "title": "POST /purchase returns HTTP 200 for auth-token declined transactions instead of 401/403",
+    "description": "The POST /purchase endpoint consistently returns HTTP 200 OK for all requests with an invalid auth_token, embedding the decline outcome in the response body as {\"status\": \"declined\", \"decline_reason\": \"invalid_auth_token\", ...}. This was observed across all 28 tests in the session. REST conventions and payment API best practices would typically return HTTP 401 (Unauthorized) or 403 (Forbidden) when authentication fails, allowing callers to detect auth failures via HTTP status code alone without parsing the response body. Callers who check only the HTTP status code will incorrectly treat auth-rejected requests as successful transactions.",
+    "steps_to_reproduce": [
+      "Send a POST request to /purchase with Content-Type: application/json",
+      "Use any invalid auth_token value in the request body, e.g. 'invalid-token', 'test-auth-token-abc123', 'supersecret', 'password', 'token', 'letmein', 'valid-token', or any of the 28 values tested",
+      "Include otherwise well-formed fields: card_number='4111111111111111', expiry_month=12, expiry_year=2026, cvv='123', credit_count=1",
+      "Observe that the HTTP response status is 200 (not 401 or 403)",
+      "Observe that the response body is: {\"status\": \"declined\", \"decline_reason\": \"invalid_auth_token\", \"credits_purchased\": 0, \"total_charged\": 0.0, \"new_credit_balance\": null, \"transaction_id\": null}",
+      "This was reproduced identically in Tests 1\u201328 across all three checkpoints"
+    ],
+    "expected_behavior": "A request with an invalid auth_token should return HTTP 401 or HTTP 403, signaling authentication/authorization failure at the HTTP layer so that callers can detect the failure without parsing the response body.",
+    "actual_behavior": "HTTP 200 is returned for every invalid-auth-token request, with the decline reason embedded only in the JSON response body. The HTTP status code alone gives no indication of failure. This was consistent across all 28 tested requests spanning a wide variety of auth_token values (empty string, common words, UUIDs, domain vocabulary, API key formats).",
+    "severity": "medium",
+    "status": "inconclusive",
+    "caveats": "The checkpoint budget was exhausted while the Skeptic still had active objections. The Skeptic raised a credible and unresolved rival explanation: this HTTP 200 behavior may be specific only to the auth-gate middleware layer, while downstream payment processing declines (card refused, Luhn failure, expired card, etc.) might correctly return 4xx status codes. All 28 data points are exclusively auth-gate rejections \u2014 no non-auth business logic decline was ever triggered because no valid auth_token was discovered. The anomaly is therefore confirmed only for the auth-token check path, not generalized to all decline types. Additionally, header-based auth delivery (Authorization: Bearer, X-API-Key, X-Auth-Token) was never tested despite being explicitly recommended in three consecutive Skeptic reviews \u2014 it remains possible the valid token is delivered via HTTP headers rather than the request body, which would mean the body-field auth_token check is intentionally a secondary/legacy mechanism with its own response conventions. The entire business logic surface of the API (card validation, pricing, success path, balance updates, transaction IDs) remains completely untested."
+  }
+]
