@@ -46,6 +46,8 @@ engine/
   adapters/
     registry.py           # name -> adapter module, resolved lazily
     token_purchase/        # first adapter, ported from experiments/token-purchase-poc
+    complex_sut/            # second adapter - concurrency/rate-limiting domain
+  bootstrap/                # generate a draft adapter from a live SUT - see below
   tests/                    # deterministic regression + parity tests (no LLM calls)
 ```
 
@@ -86,6 +88,12 @@ parameters with `--model`, `--max-checkpoints`, `--first-round-budget`,
 3. Register it in `engine/adapters/registry.py`'s `_ADAPTERS` map.
 4. Do **not** touch `engine/tools.py` - the hypothesis/Skeptic schema is
    shared across every adapter by design.
+
+Alternatively, `engine/bootstrap/cli.py` can generate a first draft of steps
+1-2 automatically by discovering/probing a live SUT for real - see the root
+[`README.md`](../README.md#bootstrapping-a-new-adapter-automatically). Still
+scoped to the "one request in, one response out" case; still ends with a
+manual registration step.
 
 ## Testing
 
