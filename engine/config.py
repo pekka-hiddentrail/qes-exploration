@@ -18,6 +18,15 @@ class RunConfig:
     default_test_budget: int = 8
     out_dir: Path = Path("runs/default")
 
+    def __post_init__(self):
+        # max_checkpoints <= 0 makes run_checkpoint_loop's range() empty, so
+        # `checkpoints` stays [] and runner.py's checkpoints[-1] raises
+        # IndexError instead of failing with a clear, actionable message.
+        for field_name in ("max_checkpoints", "max_attempts", "first_round_test_budget", "default_test_budget"):
+            value = getattr(self, field_name)
+            if value < 1:
+                raise ValueError(f"RunConfig.{field_name} must be >= 1, got {value}")
+
     @staticmethod
     def for_adapter(
         adapter: SUTAdapter,

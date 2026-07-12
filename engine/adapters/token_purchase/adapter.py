@@ -247,6 +247,16 @@ def validate_casting_response(data) -> list[str]:
             for key in required_test_keys:
                 if key not in test:
                     errors.append(f"candidate_tests[{i}] missing '{key}'")
+            # execute_test() passes auth_token/card_number/cvv straight into
+            # unwrap_accidental_json_body(), which calls .strip() on them - a
+            # non-string value here (e.g. a stray number or null) would crash
+            # the run rather than just producing a bad, but harmless, test.
+            for key in ("linked_hypothesis", "auth_token", "card_number", "cvv", "predicted_outcome"):
+                if key in test and not isinstance(test[key], str):
+                    errors.append(f"candidate_tests[{i}].{key} must be a string")
+            for key in ("expiry_month", "expiry_year", "credit_count"):
+                if key in test and not isinstance(test[key], int):
+                    errors.append(f"candidate_tests[{i}].{key} must be an integer")
             if test.get("predicted_status") not in ("approved", "declined"):
                 errors.append(f"candidate_tests[{i}].predicted_status must be 'approved' or 'declined'")
             if test.get("predicted_status") == "declined" and test.get("predicted_decline_reason") not in KNOWN_DECLINE_REASONS:
