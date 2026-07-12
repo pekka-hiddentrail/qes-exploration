@@ -198,7 +198,8 @@ def _fields_from_schema(schema: dict) -> list[DiscoveredField]:
     properties = schema.get("properties", {})
     if not isinstance(properties, dict):
         return []
-    required = set(schema.get("required", []))
+    required_list = schema.get("required", [])
+    required = set(required_list) if isinstance(required_list, list) else set()
     fields = []
     for name, field_schema in properties.items():
         if not isinstance(field_schema, dict):
