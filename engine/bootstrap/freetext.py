@@ -99,9 +99,8 @@ def validate_schema_draft_response(data) -> list[str]:
         errors.append("'endpoint_path' must be a string")
     if "confidence_notes" in data and not isinstance(data.get("confidence_notes"), str):
         errors.append("'confidence_notes' must be a string")
-    if data.get("method") not in ("GET", "POST", "PUT", "PATCH", "DELETE"):
-        errors.append("'method' must be one of GET/POST/PUT/PATCH/DELETE")
-
+    if data.get("method") not in ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"):
+        errors.append("'method' must be one of GET/POST/PUT/PATCH/DELETE/OPTIONS/HEAD")
     for list_key in ("request_fields", "response_fields"):
         fields = data.get(list_key)
         if not isinstance(fields, list):
