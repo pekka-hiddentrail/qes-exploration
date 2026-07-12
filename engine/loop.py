@@ -130,8 +130,22 @@ def get_skeptic_review(
     )
 
 
-def run_checkpoint_loop(client: Anthropic, adapter: SUTAdapter, run_config: RunConfig, happy_day_example: dict, test_counter):
-    """Returns (casting_log, checkpoints, stopped_reason)."""
+def run_checkpoint_loop(
+    client: Anthropic,
+    adapter: SUTAdapter,
+    run_config: RunConfig,
+    happy_day_example: dict,
+    test_counter,
+    on_checkpoint=None,
+):
+    """Returns (casting_log, checkpoints, stopped_reason).
+
+    on_checkpoint(casting_log, checkpoints), if given, is called after every
+    checkpoint completes - not just once at the end - so a crash partway
+    through (a non-retryable API error, an unexpected bug) doesn't discard
+    checkpoints that already finished. Each call is a full, self-consistent
+    snapshot; the caller decides what to do with it (e.g. write it to disk).
+    """
     casting_log = []
     checkpoints = []
     prior_feedback = None
@@ -191,6 +205,8 @@ def run_checkpoint_loop(client: Anthropic, adapter: SUTAdapter, run_config: RunC
 
         checkpoints.append({"checkpoint": checkpoint_num, "hypothesis": hypothesis, "skeptic_review": skeptic_review})
 
+        if on_checkpoint is not None:
+            on_checkpoint(list(casting_log), list(checkpoints))
         if skeptic_review["verdict"] == "strong_enough":
             stopped_reason = "skeptic_satisfied"
             break

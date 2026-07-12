@@ -5,6 +5,7 @@ adapter."""
 
 import itertools
 import json
+import traceback
 
 import httpx
 
@@ -29,6 +30,10 @@ def run(adapter: SUTAdapter, run_config: RunConfig) -> dict:
     happy_day_example = get_happy_day_example(adapter)
     print(f"  {happy_day_example['request']['body']} -> {happy_day_example['response']['body']}")
 
+    out_dir = run_config.out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "output.json"
+
     output = {
         "api_schema": adapter.api_schema_doc,
         "onboarding_extra": adapter.onboarding_extra,
@@ -37,8 +42,22 @@ def run(adapter: SUTAdapter, run_config: RunConfig) -> dict:
     bug_reports = []
     test_counter = itertools.count(1)
 
+    def save_progress(casting_log, checkpoints):
+        # Called after every checkpoint, not just once at the end - a crash
+        # partway through (a non-retryable API error, an unexpected bug)
+        # shouldn't discard checkpoints that already finished and cost real
+        # API calls to produce.
+        output["casting_log"] = casting_log
+        output["checkpoints"] = checkpoints
+        output["stopped_reason"] = "in_progress"
+        tmp_path = out_path.with_name(out_path.name + ".tmp")
+        tmp_path.write_text(json.dumps(output, indent=2))
+        tmp_path.replace(out_path)
+
     try:
-        casting_log, checkpoints, stopped_reason = run_checkpoint_loop(client, adapter, run_config, happy_day_example, test_counter)
+        casting_log, checkpoints, stopped_reason = run_checkpoint_loop(
+            client, adapter, run_config, happy_day_example, test_counter, on_checkpoint=save_progress
+        )
         output["casting_log"] = casting_log
         output["checkpoints"] = checkpoints
         output["stopped_reason"] = stopped_reason
@@ -57,11 +76,17 @@ def run(adapter: SUTAdapter, run_config: RunConfig) -> dict:
     except RuntimeError as e:
         print(f"Stopped early: {e}")
         output["error"] = str(e)
+        output["stopped_reason"] = "error"
+    except Exception as e:
+        # Anything else (a non-retryable API error like a bad key, a genuine
+        # bug) - keep whatever checkpoints save_progress already wrote rather
+        # than losing them, but print the full traceback since this path is
+        # unexpected and worth being able to actually debug.
+        print(f"Stopped early due to an unexpected error: {e!r}")
+        traceback.print_exc()
+        output["error"] = str(e)
+        output["stopped_reason"] = "error"
 
-    out_dir = run_config.out_dir
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    out_path = out_dir / "output.json"
     out_path.write_text(json.dumps(output, indent=2))
     print(f"\nWrote result to {out_path}")
 
