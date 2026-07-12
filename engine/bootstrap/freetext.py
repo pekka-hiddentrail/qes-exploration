@@ -63,7 +63,7 @@ FREETEXT_SCHEMA_TOOL = {
                     "schema is a draft that still needs to be confirmed against the real system."
                 ),
             },
-        }
+        },
         "required": ["endpoint_path", "method", "request_fields", "response_fields", "confidence_notes"],
     },
 }
