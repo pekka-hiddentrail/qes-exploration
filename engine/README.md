@@ -94,5 +94,14 @@ pip install -r engine/requirements.txt
 python -m pytest engine/tests
 ```
 
-`test_sut_regression.py` and `test_client_retry.py` make no Anthropic calls
-and run in-process against the mock SUT via FastAPI's `TestClient`.
+Runs automatically on every push to `master` and every PR via
+`.github/workflows/engine-tests.yml` - no Anthropic API key needed, since no
+test makes a real LLM call.
+
+Most tests (`test_sut_regression.py`, `test_client_retry.py`, the
+`*_parity.py` files) run in-process against the mock SUT via FastAPI's
+`TestClient` or against stubbed clients. `test_complex_sut_regression.py` is
+the one exception: its bug is a genuine concurrency race that depends on
+Starlette actually dispatching sync handlers across a real thread pool, so
+it spins up a real `uvicorn` subprocess and fires genuine concurrent
+requests rather than using the in-process test client.
