@@ -7,7 +7,7 @@ yet. Follows the same tool/system-prompt/validator pattern as every other
 LLM call in this project (see engine/tools.py).
 """
 
-from engine.bootstrap.discovery import DiscoveredEndpoint, DiscoveredField, DiscoveredSchema
+from engine.bootstrap.discovery import DiscoveredEndpoint, DiscoveredSchema, field_from_dict
 from engine.client import DEFAULT_MAX_ATTEMPTS, DEFAULT_MODEL, call_tool_with_retry
 
 _JSON_SCHEMA_TYPES = ("string", "integer", "number", "boolean", "array", "object", "unknown")
@@ -128,18 +128,6 @@ def validate_schema_draft_response(data) -> list[str]:
     return errors
 
 
-def _to_discovered_field(raw: dict) -> DiscoveredField:
-    return DiscoveredField(
-        name=raw["name"],
-        type=raw["type"],
-        required=raw["required"],
-        enum=raw["enum"] or None,  # [] means unconstrained, matching DiscoveredField's own convention
-        has_default=False,
-        default=None,
-        description=raw.get("description", ""),
-    )
-
-
 def propose_schema_from_text(
     client, spec_text: str, model: str = DEFAULT_MODEL, max_attempts: int = DEFAULT_MAX_ATTEMPTS
 ) -> DiscoveredSchema:
@@ -158,8 +146,8 @@ def propose_schema_from_text(
     endpoint = DiscoveredEndpoint(
         path=result["endpoint_path"],
         method=result["method"],
-        request_fields=[_to_discovered_field(f) for f in result["request_fields"]],
-        response_fields=[_to_discovered_field(f) for f in result["response_fields"]],
+        request_fields=[field_from_dict(f) for f in result["request_fields"]],
+        response_fields=[field_from_dict(f) for f in result["response_fields"]],
         raw_request_schema={},
         raw_response_schema={},
     )

@@ -254,3 +254,19 @@ def _field_enum(field_schema: dict) -> list[str] | None:
             if isinstance(branch, dict) and "enum" in branch:
                 return list(branch["enum"])
     return None
+
+
+def field_from_dict(raw: dict) -> DiscoveredField:
+    """Converts a {name, type, required, enum, description} dict - the shape
+    both freetext.py's and probe.py's LLM tool calls produce - into a
+    DiscoveredField. Lives here, not duplicated in each caller, since it's
+    fundamentally about constructing this module's own dataclass."""
+    return DiscoveredField(
+        name=raw["name"],
+        type=raw["type"],
+        required=raw["required"],
+        enum=raw.get("enum") or None,  # [] means unconstrained, matching this module's own convention
+        has_default=False,
+        default=None,
+        description=raw.get("description", ""),
+    )

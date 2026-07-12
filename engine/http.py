@@ -5,10 +5,15 @@ import httpx
 
 
 def call_sut_once(
-    base_url: str, path: str, request_body: dict, timeout: float = 30.0, transport: httpx.BaseTransport | None = None
+    base_url: str,
+    path: str,
+    request_body: dict,
+    timeout: float = 30.0,
+    transport: httpx.BaseTransport | None = None,
+    method: str = "POST",
 ) -> dict:
     with httpx.Client(transport=transport) as client:
-        response = client.post(base_url + path, json=request_body, timeout=timeout)
+        response = client.request(method, base_url + path, json=request_body, timeout=timeout)
         try:
             body = response.json()
         except ValueError:
