@@ -76,6 +76,7 @@ def run(adapter: SUTAdapter, run_config: RunConfig) -> dict:
     except RuntimeError as e:
         print(f"Stopped early: {e}")
         output["error"] = str(e)
+        output["stopped_reason"] = "error"
     except Exception as e:
         # Anything else (a non-retryable API error like a bad key, a genuine
         # bug) - keep whatever checkpoints save_progress already wrote rather
@@ -84,6 +85,7 @@ def run(adapter: SUTAdapter, run_config: RunConfig) -> dict:
         print(f"Stopped early due to an unexpected error: {e!r}")
         traceback.print_exc()
         output["error"] = str(e)
+        output["stopped_reason"] = "error"
 
     out_path.write_text(json.dumps(output, indent=2))
     print(f"\nWrote result to {out_path}")
